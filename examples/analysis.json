@@ -1,0 +1,98 @@
+{
+  "summary": "주문 목록 CSV 내보내기는 확정되었습니다. UTF-8 인코딩과 주문 ID·주문 금액 열을 제공합니다. XLSX는 범위에서 제외되었으며 날짜 열의 시간대는 결정이 필요합니다.",
+  "requirements": [
+    {
+      "id": "REQ-CSV",
+      "statement": "주문 목록을 UTF-8 CSV 파일로 내보낸다.",
+      "decisionState": "confirmed",
+      "sourceRefs": [
+        {
+          "messageVersionId": "demo-message-1-v1",
+          "quote": "주문 목록을 CSV로 내보내야 합니다."
+        },
+        {
+          "messageVersionId": "demo-message-4-v1",
+          "quote": "CSV 파일은 UTF-8이어야 합니다."
+        }
+      ],
+      "supersedesIds": [],
+      "blockingQuestionIds": [],
+      "acceptanceCriteria": [
+        {
+          "id": "AC-UTF8",
+          "text": "다운로드한 CSV 파일은 UTF-8로 인코딩된다.",
+          "origin": "source",
+          "sourceRefs": [
+            {
+              "messageVersionId": "demo-message-4-v1",
+              "quote": "CSV 파일은 UTF-8이어야 합니다."
+            }
+          ]
+        },
+        {
+          "id": "AC-COLUMNS",
+          "text": "CSV에 주문 ID와 주문 금액 열이 포함된다.",
+          "origin": "source",
+          "sourceRefs": [
+            {
+              "messageVersionId": "demo-message-4-v1",
+              "quote": "다운로드한 파일에 주문 ID와 주문 금액 열이 있어야 합니다."
+            }
+          ]
+        },
+        {
+          "id": "AC-COMMAS",
+          "text": "값에 쉼표가 포함된 주문도 올바른 열 개수로 읽을 수 있다. 이 검증 기준은 구현 전 사람이 검토한다.",
+          "origin": "derived",
+          "sourceRefs": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-TIMEZONE",
+      "statement": "날짜 열에 한국 시간(KST)을 사용하는 방안을 제안한다.",
+      "decisionState": "proposed",
+      "sourceRefs": [
+        {
+          "messageVersionId": "demo-message-3-v1",
+          "quote": "날짜 열은 한국 시간(KST)으로 보여주면 어떨까요?"
+        }
+      ],
+      "supersedesIds": [],
+      "blockingQuestionIds": [
+        "Q-TIMEZONE"
+      ],
+      "acceptanceCriteria": []
+    },
+    {
+      "id": "REQ-XLSX",
+      "statement": "XLSX 내보내기를 제공한다.",
+      "decisionState": "rejected",
+      "sourceRefs": [
+        {
+          "messageVersionId": "demo-message-2-v1",
+          "quote": "XLSX 내보내기는 이번 범위에서 제외합니다."
+        }
+      ],
+      "supersedesIds": [],
+      "blockingQuestionIds": [],
+      "acceptanceCriteria": []
+    }
+  ],
+  "questions": [
+    {
+      "id": "Q-TIMEZONE",
+      "text": "날짜 열을 어떤 시간대로 표시할지 결정해야 한다.",
+      "blocking": true,
+      "affectedRequirementIds": [
+        "REQ-TIMEZONE"
+      ],
+      "sourceRefs": [
+        {
+          "messageVersionId": "demo-message-3-v1",
+          "quote": "시간대는 아직 확정하지 않았습니다."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Run synthetic offline example
+        run: |
+          node dist/cli.js analyze 'https://example.slack.com/archives/CDEMO12345/p1795046400000001' --config examples/project.json --snapshot examples/thread.json --analysis-file examples/analysis.json
+          node dist/cli.js history --config examples/project.json --limit 20

@@ -1,0 +1,33 @@
+{
+  "name": "slack-dev-assistant",
+  "version": "0.1.0",
+  "description": "Evidence-linked Slack discussion analysis for developers",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "slack-dev": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@slack/web-api": "^8.4.0",
+    "commander": "^15.1.0",
+    "dotenv": "^18.0.10",
+    "openai": "^7.60.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}

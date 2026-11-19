@@ -1,0 +1,48 @@
+{
+  "id": "synthetic-snapshot-1",
+  "workspace": "example",
+  "channelId": "CDEMO12345",
+  "rootTs": "1795046400.000001",
+  "collectedAt": "2026-11-19T01:30:00.000Z",
+  "status": "complete",
+  "messages": [
+    {
+      "id": "demo-message-1-v1",
+      "ts": "1795046400.000001",
+      "text": "요구사항: 주문 목록을 CSV로 내보내야 합니다. 파일은 UTF-8로 인코딩해 주세요.",
+      "author": "UDEMO1",
+      "editedTs": null,
+      "permalink": "https://example.slack.com/archives/CDEMO12345/p1795046400000001",
+      "hasAttachments": false
+    },
+    {
+      "id": "demo-message-2-v1",
+      "ts": "1795046460.000002",
+      "text": "결정: 첫 버전은 CSV 내보내기만 제공합니다. XLSX 내보내기는 이번 범위에서 제외합니다.",
+      "author": "UDEMO2",
+      "editedTs": null,
+      "permalink": "https://example.slack.com/archives/CDEMO12345/p1795046460000002",
+      "hasAttachments": false
+    },
+    {
+      "id": "demo-message-3-v1",
+      "ts": "1795046520.000003",
+      "text": "날짜 열은 한국 시간(KST)으로 보여주면 어떨까요? 시간대는 아직 확정하지 않았습니다.",
+      "author": "UDEMO3",
+      "editedTs": null,
+      "permalink": "https://example.slack.com/archives/CDEMO12345/p1795046520000003",
+      "hasAttachments": false
+    },
+    {
+      "id": "demo-message-4-v1",
+      "ts": "1795046580.000004",
+      "text": "확인: CSV 파일은 UTF-8이어야 합니다. 다운로드한 파일에 주문 ID와 주문 금액 열이 있어야 합니다.",
+      "author": "UDEMO4",
+      "editedTs": null,
+      "permalink": "https://example.slack.com/archives/CDEMO12345/p1795046580000004",
+      "hasAttachments": false
+    }
+  ],
+  "warnings": [],
+  "contentHash": "e41cc397a7a09dda75e378cfc621ec08a00b346bd98a3d9e386bb560c6988ce5"
+}

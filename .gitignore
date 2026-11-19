@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.slack-dev/
+slack-dev.config.json
+*.sqlite*
+*.db*
+.DS_Store

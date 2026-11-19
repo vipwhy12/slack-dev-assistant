@@ -1,0 +1,9 @@
+{
+  "projectId": "synthetic-orders-demo",
+  "slack": {
+    "workspace": "example",
+    "channelIds": ["CDEMO12345"]
+  },
+  "storageDir": "../.slack-dev/demo",
+  "model": "gpt-4.1-mini"
+}
