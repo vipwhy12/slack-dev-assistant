@@ -42,7 +42,7 @@ node dist/cli.js history --config examples/project.json --limit 20
 
 ## 실제 Slack 연결
 
-1. Slack 앱을 만들고 대상 워크스페이스에 설치합니다.
+1. Slack 앱을 만들고 대상 워크스페이스에 설치합니다. 공개 개발 채널만 읽는 봇은 [`examples/slack-app-manifest.json`](examples/slack-app-manifest.json)으로 만들 수 있습니다. 이 매니페스트는 `channels:history` 하나만 요청합니다. 설치한 봇을 읽을 채널에 추가합니다.
 2. 대상 채널 스레드를 읽을 수 있는 OAuth 토큰을 준비합니다. 공개 채널은 `channels:history`, 비공개 채널은 `groups:history` 권한과 대상 채널 접근 권한이 필요합니다. 현재 `conversations.replies` 공식 문서는 봇·사용자 토큰을 지원 대상으로 안내합니다. 실제 토큰과 채널 조합은 작은 스레드로 먼저 확인하세요.
 3. `.env.example`을 `.env`로 복사하고 `SLACK_TOKEN`, `OPENAI_API_KEY`를 설정합니다. `.env`는 CLI를 실행하는 현재 디렉터리에서 읽습니다.
 4. 프로젝트 설정에서 실제 워크스페이스와 허용 채널을 지정합니다. 설정 파일에 토큰을 넣지 않습니다.
@@ -74,8 +74,17 @@ Slack API의 권한·보존 정책에 따라 원문을 전부 읽지 못할 수 
 
 ## 명령
 
+LLM 키 없이 Slack 연결부터 확인할 수 있습니다. `doctor`는 토큰의 워크스페이스를 검증하고, `collect`는 지정한 스레드를 수집해 `storageDir/collections/<snapshotId>/snapshot.json`에 저장합니다. stdout에는 원문이나 토큰 없이 수집 상태, 메시지 수, 경고 수, 파일 경로만 출력합니다. `doctor` 성공은 인증 확인이며 채널 접근은 `collect`로 검증합니다. 수집 결과는 `analyze --snapshot <snapshotPath>`에 사용할 수 있습니다.
+
+```sh
+node dist/cli.js doctor --config slack-dev.config.json
+node dist/cli.js collect '<Slack 스레드 URL>' --config slack-dev.config.json
+```
+
 | 명령 | 용도 |
 | --- | --- |
+| `doctor --config <file>` | Slack 인증 및 워크스페이스 일치를 확인합니다. LLM 키는 필요하지 않습니다. |
+| `collect <thread-url> --config <file>` | LLM 없이 스레드 원문과 링크를 수집합니다. 부분 수집 시 종료 코드 2를 반환합니다. |
 | `analyze <thread-url> --config <file>` | Slack 스레드를 수집하고 요구사항을 분석합니다. |
 | `analyze ... --snapshot <file>` | 검증된 스냅샷 파일로 Slack 수집을 대체합니다. |
 | `analyze ... --analysis-file <file>` | Zod 스키마의 JSON 파일로 모델 호출을 대체합니다. 원문 검증은 그대로 수행합니다. |

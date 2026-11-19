@@ -1,0 +1,19 @@
+{
+  "display_information": {
+    "name": "Slack Dev Assistant",
+    "description": "Read-only Slack thread analysis CLI"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "slack-dev-assistant",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:history"
+      ]
+    }
+  }
+}

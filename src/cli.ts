@@ -9,11 +9,27 @@ import { OpenAIAnalyzer } from './analysis.js';
 import { createSlackClient, collectThread } from './slack.js';
 import { analyzeThread, FileAnalyzer, reviewRun, safeError } from './workflow.js';
 import { RunStore } from './store.js';
+import { checkConnection, collectSnapshot } from './connection.js';
 
 const program = new Command().name('slack-dev').version('0.1.0')
   .description('Analyze Slack discussions into evidence-linked requirement drafts.');
 const configOption = () => new Option('-c, --config <path>', 'project configuration JSON').default('slack-dev.config.json');
 const json = (value: unknown) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+program.command('doctor').addOption(configOption())
+  .description('Verify the Slack token and configured workspace without invoking an LLM')
+  .action(async (options: {config: string}) => {
+    json(await checkConnection(loadConfig(options.config), process.env.SLACK_TOKEN ?? ''));
+  });
+program.command('collect').argument('<thread-url>').addOption(configOption())
+  .description('Collect a Slack thread snapshot without invoking an LLM')
+  .action(async (threadUrl: string, options: {config: string}) => {
+    const config = loadConfig(options.config);
+    const token = process.env.SLACK_TOKEN ?? '';
+    await checkConnection(config, token);
+    const result = await collectSnapshot(config, threadUrl, token);
+    json(result);
+    if (result.status === 'partial') process.exitCode = 2;
+  });
 program.command('analyze').argument('<thread-url>', 'allowed Slack thread permalink')
   .addOption(configOption()).option('--snapshot <path>', 'replay a local collected snapshot; no Slack calls')
   .option('--analysis-file <path>', 'replay a local draft; no LLM calls').option('--force', 'create a fresh analysis even if identical input was already analyzed')
