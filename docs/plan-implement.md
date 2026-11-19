@@ -68,6 +68,8 @@ docker pull node:24
 
 검증에는 Git 메타데이터와 비밀 파일을 제외한 별도 스냅샷을 사용합니다. CLI를 실행한 호스트의 인증 정보나 `.env`를 컨테이너에 전달하지 않습니다. 테스트가 변경한 파일을 컨트롤러의 worktree로 가져오지 않습니다.
 
+실제 사용한 불변 Docker 이미지 ID(`sha256:…`)를 변경 전·후 명령 결과의 `imageId`에 기록합니다. 두 단계의 이미지 ID가 다르면 검증을 완료 처리하지 않습니다. 재현성이 필요한 프로젝트는 태그만 사용하기보다 고정한 이미지 digest로 설정하세요.
+
 ## 2. 분석을 검토하고 구현 범위 정하기
 
 기존 `analyze` 결과의 `analysis.json`을 복사해 원문과 비교하고 수정합니다. `review`에 넣는 파일은 분석 객체이며 `show`의 전체 출력을 넣는 형식은 아닙니다.
@@ -171,7 +173,7 @@ node dist/cli.js implement '<planId>' \
   --config development-project.json
 ```
 
-검증 후 설정한 remote로 커밋을 푸시하고 `github.repository`에 Draft PR을 생성합니다. PR에는 요구사항 ID와 검증 결과를 남기며, 상세 Slack 원문 근거는 로컬 보고서에서 확인합니다. 이 도구는 PR을 병합하거나 배포하지 않습니다. 로컬 테스트 대역으로 PR 흐름을 검사한 결과와 실제 GitHub 계정에 게시한 결과는 구분해야 합니다.
+검증 후 설정한 remote로 커밋을 푸시하고 `github.repository`에 Draft PR을 생성합니다. PR에는 요구사항 ID와 검증 결과를 남기며, 상세 Slack 원문 근거는 로컬 보고서에서 확인합니다. 실제 게시 성공은 실행 결과의 `prUrl`과 `publish` 단계에서 확인합니다. 이 도구는 PR을 병합하거나 배포하지 않습니다.
 
 ## 6. 중단된 실행 이어가기
 
@@ -213,8 +215,8 @@ node dist/cli.js budget --config development-project.json
 | `context.json` | 계획·구현에 사용한 저장소 문맥 |
 | `changes.json` | 적용 대상으로 검증한 파일 변경 |
 | `patch.diff` | worktree의 코드 변경 |
-| `baseline.json` | 변경 전 명령 결과와 출력 |
-| `verification.json` | 변경 후 명령 결과와 출력 |
+| `baseline.json` | 변경 전 명령 결과·출력·Docker 이미지 ID |
+| `verification.json` | 변경 후 명령 결과·출력·Docker 이미지 ID |
 | `report.md` | 구현·테스트·게시 결과와 남은 확인 사항 |
 | `history.sqlite` | 분석, 검토, 계획, 허가와 구현 실행 이력 |
 | `budget.sqlite` | 유료 호출의 예산 예약과 사용량 기반 비용 기록 |
@@ -222,6 +224,29 @@ node dist/cli.js budget --config development-project.json
 파일의 존재만으로 성공을 판단하지 않습니다. 실패한 실행에도 진단용 결과물이 남을 수 있습니다. 실행 상태와 검증 보고서를 함께 확인하세요. 저장소 문맥과 결과물에는 애플리케이션 코드와 Slack 원문이 포함될 수 있으므로 `storageDir`를 Git에서 제외합니다.
 
 실행별 결과는 `storageDir/runs/<runId>/`, 허가는 `storageDir/grants/<grantId>.json`, 작업 사본은 `storageDir/worktrees/<runId>/`에 저장합니다. 구현 브랜치는 `slack-dev/<runId>`입니다. 계획의 `planId`와 그 실행의 `runId`는 서로 다른 ID입니다. `history`에는 모드별 실행이 함께 표시되며 `show <runId>`에서 세부 이력을 확인합니다. `plan` 완료 상태는 `needs_input`, 허가 후 계획은 `ready`, 구현 완료 상태는 `review_ready`입니다. `review_ready`는 사람이 diff와 미검증 항목을 검토할 차례라는 뜻입니다.
+
+## 재현 가능한 스모크 테스트
+
+[`scripts/smoke-development.mjs`](../scripts/smoke-development.mjs)는 합성 한국어 대화와 의존성이 없는 작은 Git 저장소를 만듭니다. 영어 인사 함수를 한국어로 바꾸는 요구사항을 사용해 분석 재생·검토·계획·허가·구현·Docker 테스트·로컬 커밋을 연결합니다. 검토와 허가도 합성 데이터에 한해서 생성하며 실제 프로젝트의 요구사항을 승인하지 않습니다.
+
+Node.js 24와 실행 중인 Docker가 필요합니다. 먼저 테스트 이미지를 명시적으로 준비합니다.
+
+```sh
+docker pull node:24-alpine
+npm run smoke:development
+```
+
+기본 실행은 계획과 코드 변경을 고정 JSON으로 재생하므로 모델 API 키와 호출 비용이 필요 없습니다. 기준 테스트와 변경 후 테스트는 실제 Docker에서 실행합니다. 생성된 테스트와 별도로 두 이름의 인사 결과를 검사하고, API 키 없는 새 CLI 프로세스에서 같은 실행을 재개해 커밋이 중복 생성되지 않는지도 확인합니다.
+
+모델의 계획·코드 생성을 함께 확인하려면 `.env`나 환경 변수에 `OPENAI_API_KEY`를 설정한 뒤 실행합니다.
+
+```sh
+npm run smoke:development -- --live
+```
+
+이 모드는 `gpt-4.1-mini`를 계획·구현에 각 한 번, 최대 두 번 호출합니다. 자동 재시도는 없으며 해당 테스트 저장 경로의 예산은 $0.90입니다. 이 금액은 상한이고 실제 비용은 반환된 토큰 사용량으로 추정합니다. 두 모드 모두 Slack API를 호출하거나 GitHub에 푸시·PR을 만들지 않습니다.
+
+매번 `.slack-dev/development-smoke-<임의 값>/`에 독립적인 합성 저장소와 이력을 만들고, 마지막 출력의 `resultPath`에 `result.json`을 저장합니다. 결과에는 실행 ID, worktree·보고서 경로, 독립 검사와 CLI 재개 결과, 예산 기록이 있습니다. **반복 실행마다 새 예산 장부를 사용하므로 $0.90은 테스트 한 번의 한도**이며 여러 번 실행한 비용을 합쳐 제한하는 값은 아닙니다.
 
 ## 자주 만나는 중단 원인
 
