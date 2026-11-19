@@ -26,11 +26,11 @@ export function writeArtifact(path: string, value: unknown, plain = false): void
 }
 export function safeError(error: unknown): { code: string; message: string; retryable: boolean } {
   let message = error instanceof Error ? error.message : 'Unknown failure';
-  for (const key of ['SLACK_TOKEN', 'OPENAI_API_KEY']) {
+  for (const key of ['SLACK_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'OPENAI_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN']) {
     const secret = process.env[key];
     if (secret) message = message.replaceAll(secret, '[REDACTED]');
   }
-  message = message.replace(/\b(?:xox[a-z]-|sk-)[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 2000);
+  message = message.replace(/\b(?:xox[a-z]-|xapp-|sk-|gh[pousr]_|github_pat_)[A-Za-z0-9_-]+/g, '[REDACTED]').replace(/https:\/\/hooks\.slack\.com\/\S+/g, '[REDACTED]').slice(0, 2000);
   const code = /rate.?limit|429/i.test(message) ? 'rate_limited'
     : /auth|token|scope|permission|not_in_channel|channel_not_found/i.test(message) ? 'access_denied'
     : /network|timeout|ECONN|fetch failed/i.test(message) ? 'network_error'
@@ -106,6 +106,7 @@ export async function analyzeThread(options: AnalyzeOptions): Promise<AnalyzeRes
       store.reuse(runId, previous.id);
       return { runId: previous.id, requestRunId: runId, status: previous.status, reused: true, reportPath };
     }
+    if (analyzer.knowledgeContext) writeArtifact(join(directory, 'knowledge-context.json'), analyzer.knowledgeContext);
     store.status(runId, 'analyzing');
     stepId = store.startStep(runId, 'analyze', inputHash);
     const draft = validateAnalysis(await analyzer.analyze(snapshot), snapshot);
@@ -128,7 +129,7 @@ export async function analyzeThread(options: AnalyzeOptions): Promise<AnalyzeRes
     throw new Error(`${failure.message}${runId ? ` (run: ${runId})` : ''}`);
   } finally { store.close(); }
 }
-export function reviewRun(config: ProjectConfig, runId: string, input: unknown, reason: string, minutes: number, actor: string): { revisionId: string; reportPath: string } {
+export function reviewRun(config: ProjectConfig, runId: string, input: unknown, reason: string, minutes: number, actor: string, expectedRevisionId?: string): { revisionId: string; reportPath: string } {
   const store = new RunStore(join(config.storageDir, 'history.sqlite'));
   try {
     store.acquireLock();
@@ -137,7 +138,8 @@ export function reviewRun(config: ProjectConfig, runId: string, input: unknown, 
     const snapshot = store.getSnapshot(runId);
     const draft: AnalysisDraft = validateAnalysis(input, snapshot);
     if (!reason.trim() || !actor.trim() || !Number.isFinite(minutes) || minutes < 0) throw new Error('Review requires reason, actor, and nonnegative finite minutes.');
-    store.latestRevision(runId);
+    const latest = store.latestRevision(runId);
+    if (expectedRevisionId && latest.id !== expectedRevisionId) throw new Error('Analysis changed after approval; review the latest revision.');
     const revisionId = randomUUID();
     const directory = join(config.storageDir, 'runs', runId, 'reviews', revisionId);
     const reportPath = join(directory, 'report.md');

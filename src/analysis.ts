@@ -129,6 +129,7 @@ export interface Analyzer {
   readonly model: string;
   readonly promptVersion: string;
   readonly usage?: AnalysisUsage;
+  readonly knowledgeContext?: unknown[];
   analyze(snapshot: ThreadSnapshot): Promise<unknown>;
 }
 export interface AnalysisUsage {
