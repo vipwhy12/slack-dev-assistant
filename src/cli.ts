@@ -10,8 +10,11 @@ import { createSlackClient, collectThread } from './slack.js';
 import { analyzeThread, FileAnalyzer, reviewRun, safeError } from './workflow.js';
 import { RunStore } from './store.js';
 import { checkConnection, collectSnapshot } from './connection.js';
+import { planRun, approvePlan, implementPlan } from './development.js';
+import { FilePlanner, OpenAIPlanner } from './planning.js';
+import { FileImplementer, OpenAIImplementer, BudgetLedger } from './generation.js';
 
-const program = new Command().name('slack-dev').version('0.1.0')
+const program = new Command().name('slack-dev').version('0.2.0')
   .description('Analyze Slack discussions into evidence-linked requirement drafts.');
 const configOption = () => new Option('-c, --config <path>', 'project configuration JSON').default('slack-dev.config.json');
 const json = (value: unknown) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -67,9 +70,46 @@ program.command('review').argument('<run-id>').addOption(configOption())
     const config = loadConfig(options.config);
     json(reviewRun(config, runId, JSON.parse(readFileSync(options.file, 'utf8')), options.reason, Number(options.minutes), options.actor));
   });
-for (const mode of ['plan', 'implement']) {
-  program.command(mode).allowUnknownOption().allowExcessArguments()
-    .description('Reserved for a future version')
-    .action(() => { throw new Error(`${mode} is not implemented in this MVP. Use analyze; no repository changes were made.`); });
-}
+program.command('plan').argument('<analyze-run-id>').addOption(configOption())
+  .description('Investigate pinned repository code and create an evidence-linked implementation plan')
+  .option('--requirements <ids>', 'comma-separated requirement IDs; defaults to active requirements')
+  .option('--plan-file <path>', 'replay a plan draft JSON without an LLM call')
+  .option('--force', 'create a new plan instead of reusing identical inputs')
+  .action(async (runId: string, options: {config: string; requirements?: string; planFile?: string; force?: boolean}) => {
+    const config = loadConfig(options.config);
+    const planner = options.planFile ? new FilePlanner(options.planFile) : new OpenAIPlanner(config);
+    json(await planRun({ config, sourceRunId: runId, planner, force: options.force,
+      ...(options.requirements ? { requirementIds: options.requirements.split(',').map(id => id.trim()) } : {}) }));
+  });
+program.command('approve-plan').argument('<plan-id>').addOption(configOption())
+  .description('Record a local execution grant for the exact reviewed specification, plan, commit and configuration')
+  .requiredOption('--reason <text>', 'reason for accepting the plan and execution scope')
+  .option('--actor <name>', 'local reviewer name', userInfo().username)
+  .option('--allow-pr', 'also permit explicit draft PR publication for this plan')
+  .action((planId: string, options: {config: string; reason: string; actor: string; allowPr?: boolean}) => {
+    json(approvePlan(loadConfig(options.config), planId, options.reason, options.actor, options.allowPr));
+  });
+program.command('implement').argument('<plan-id>').addOption(configOption())
+  .description('Apply a granted plan in an isolated worktree, verify in Docker, and optionally publish a draft PR')
+  .requiredOption('--grant <id>', 'execution grant returned by approve-plan')
+  .option('--changes-file <path>', 'replay validated full-file changes without an LLM call')
+  .option('--publish', 'push the verified branch and create/reuse a draft PR; grant must allow PRs')
+  .option('--resume <run-id>', 'resume the recorded patch/verification/publication without regenerating changes')
+  .action(async (planId: string, options: {config: string; grant: string; changesFile?: string; publish?: boolean; resume?: string}) => {
+    const config = loadConfig(options.config);
+    // Instantiate the network adapter lazily: a completed checkpoint can resume without a key.
+    let delegate: OpenAIImplementer | undefined;
+    const implementer = options.changesFile ? new FileImplementer(options.changesFile) : {
+      name: 'openai', model: config.model, promptVersion: 'implementation-v1',
+      get usage() { return delegate?.usage; },
+      async implement(input: Parameters<OpenAIImplementer['implement']>[0]) { delegate = new OpenAIImplementer(config); return delegate.implement(input); },
+    };
+    json(await implementPlan({ config, planId, grantId: options.grant, implementer, publish: options.publish, resumeRunId: options.resume }));
+  });
+program.command('budget').addOption(configOption()).description('Show cumulative planning/implementation API reservations and estimated usage')
+  .action((options: {config: string}) => {
+    const config = loadConfig(options.config);
+    const ledger = new BudgetLedger(config.storageDir, config.development?.budgetUsd ?? 10);
+    try { json(ledger.summary()); } finally { ledger.close(); }
+  });
 program.parseAsync().catch(error => { process.stderr.write(`Error: ${safeError(error).message}\n`); process.exitCode = 1; });

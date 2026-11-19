@@ -1,6 +1,6 @@
 # slack-dev-assistant
 
-Slack 스레드의 논의를 원문 근거가 연결된 개발 요구사항으로 정리하는 TypeScript/Node.js CLI입니다. 첫 MVP는 `analyze`와 사람의 검토 이력에 집중합니다. 요구사항의 논의 상태와 사람이 검토한 상태를 분리하며, 분석 결과가 코드 실행 권한을 부여하지 않습니다.
+Slack 스레드의 논의를 원문 근거가 연결된 개발 요구사항으로 정리하고, 검토한 요구사항으로 구현 계획·코드 변경·테스트·Draft PR을 만드는 TypeScript/Node.js CLI입니다. `analyze → review → plan → approve-plan → implement` 순서로 실행합니다. 요구사항의 논의 상태, 사람의 검토, 구현 허가를 별도로 기록합니다.
 
 ## 구현 범위
 
@@ -11,9 +11,12 @@ Slack 스레드의 논의를 원문 근거가 연결된 개발 요구사항으�
 - 원문에 명시된 수용 기준(`source`)과 분석기가 제안한 기준(`derived`) 구분
 - SQLite 실행 이력, 불변 스냅샷, 분석 및 사람의 수정 버전, 단계·실패 기록
 - JSON·Markdown 결과물, 동일 입력 재사용, 명시적 재분석(`--force`)
+- 요구사항·저장소 버전에 연결된 구현 계획과 범위를 지정한 실행 허가
+- 별도 Git worktree의 파일 변경, Docker 안에서의 변경 전·후 테스트, 로컬 커밋·diff·검증 보고서
+- 선택적으로 푸시·GitHub Draft PR 생성
 - 네트워크와 API 키가 필요 없는 합성 예제 및 자동 테스트
 
-`plan`과 `implement`는 확장을 위한 명령 경계만 정의되어 있습니다. 호출하면 미지원 오류로 종료합니다. 현재 버전은 저장소 코드를 변경하거나 PR을 생성하지 않습니다.
+명령을 실행할 때 처리하는 로컬 도구입니다. Slack 새 메시지를 상시 감지하지 않으며 PR 병합이나 배포를 수행하지 않습니다. `implement`는 모델이 제안한 구조화된 파일 변경만 적용하고, 설정된 테스트 명령만 Docker 안에서 실행합니다.
 
 ## 시작하기
 
@@ -60,7 +63,7 @@ node dist/cli.js history --config examples/project.json --limit 20
 }
 ```
 
-`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 모델은 계정에서 사용 가능한 구조화 출력 지원 모델로 변경할 수 있습니다.
+`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 분석에서는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 계획·구현에서는 변경할 Git 저장소의 경로로 반드시 지정합니다. `analyze` 모델은 계정에서 사용 가능한 구조화 출력 지원 모델로 변경할 수 있습니다. 비용을 계산하는 `plan`·`implement`의 모델 지원 범위는 [구현 가이드](docs/plan-implement.md)를 확인하세요.
 
 ```sh
 node dist/cli.js analyze \
@@ -92,7 +95,16 @@ node dist/cli.js collect '<Slack 스레드 URL>' --config slack-dev.config.json
 | `history --config <file> --limit 20` | 실행 목록을 조회합니다. |
 | `show <runId> --config <file>` | 실행의 결과·수정 버전·단계·개입 기록을 JSON으로 조회합니다. |
 | `review <runId> --file <file> --reason <text> --minutes <n> --config <file>` | 사람이 수정한 분석 JSON을 검증하고 별도 버전으로 기록합니다. |
-| `plan`, `implement` | 현재 MVP에서는 지원하지 않습니다. |
+| `plan <runId> --config <file>` | 분석의 최신 버전과 저장소를 읽어 구현 계획을 만듭니다. |
+| `plan <runId> --requirements <id,id> --config <file>` | 선택한 요구사항으로 계획 범위를 제한합니다. |
+| `plan <runId> --plan-file <file> --config <file>` | 모델 대신 구조화된 계획 JSON을 검증해 사용합니다. |
+| `approve-plan <planId> --reason <text> --config <file>` | 검토·버전·범위를 확인한 뒤 해당 계획에 구현 허가를 발급합니다. |
+| `approve-plan ... --allow-pr` | 해당 허가에 GitHub Draft PR 게시 권한을 포함합니다. |
+| `implement <planId> --grant <grantId> --config <file>` | 허가된 파일 변경과 Docker 테스트 후 별도 브랜치에 로컬 커밋을 만듭니다. |
+| `implement ... --changes-file <file>` | 모델 대신 구조화된 파일 변경 JSON을 검증해 사용합니다. |
+| `implement ... --publish` | 검증한 커밋을 허가된 GitHub 저장소에 푸시하고 Draft PR을 만듭니다. |
+| `implement ... --resume <implementationRunId>` | 저장한 실행 체크포인트에서 검증·게시를 이어갑니다. |
+| `budget --config <file>` | 계획·구현 API의 누적 예약·추정 사용액과 한도를 조회합니다. |
 
 `--snapshot`은 스키마, 스레드 식별자와 메시지 원문 링크를 검증한 뒤 실제 내용으로 `contentHash`를 다시 계산합니다. 파일에 들어 있는 기존 해시를 무결성 서명으로 신뢰하지 않습니다. `--analysis-file`은 `examples/analysis.json`과 같은 분석 객체를 받습니다. 실행 결과 전체를 그대로 넣는 형식은 아닙니다.
 
@@ -129,6 +141,35 @@ node dist/cli.js show '<runId>' --config project.json
 
 검토자 이름은 기본적으로 OS 사용자명이며 `--actor <name>`으로 지정할 수 있습니다. 검토 결과 파일은 해당 실행의 `reviews/<revisionId>/`에 저장됩니다.
 
+## 계획과 구현
+
+먼저 [개발 프로젝트 설정 예제](examples/development-project.json)를 복사해 대상 `repoPath`, 읽기·쓰기 범위, 테스트 명령과 Docker 이미지를 지정합니다. Git 저장소와 Docker 실행 환경이 필요하며, 테스트 이미지에는 런타임과 프로젝트 의존성이 미리 설치되어 있어야 합니다. PR 게시를 사용할 때는 GitHub CLI(`gh`) 인증과 `github` 설정도 필요합니다.
+
+```sh
+# 분석 결과를 사람이 검토하고 수정본을 기록합니다.
+node dist/cli.js review '<analyzeRunId>' \
+  --file reviewed-analysis.json --reason '구현할 요구사항과 수용 기준 검토 완료' \
+  --minutes 5 --config development-project.json
+
+# 선택한 요구사항으로 계획을 생성합니다.
+node dist/cli.js plan '<analyzeRunId>' \
+  --requirements REQ-CSV --config development-project.json
+
+# 출력된 planId의 plan.json과 plan.md를 확인한 후 허가합니다.
+node dist/cli.js approve-plan '<planId>' \
+  --reason '변경 파일과 테스트 범위를 확인함' --config development-project.json
+
+# 출력된 grantId로 코드 변경과 테스트를 수행합니다.
+node dist/cli.js implement '<planId>' \
+  --grant '<grantId>' --config development-project.json
+```
+
+사람의 검토 전에도 계획 초안은 만들 수 있습니다. 구현 허가에는 최신 분석 버전의 사람 검토, 선택한 요구사항의 `confirmed` 상태, 해당 요구사항에 영향을 주는 차단 질문의 해소가 필요합니다. 검토나 저장소 변경으로 계획의 기준 버전이 달라졌다면 다시 계획을 만듭니다. 분석 실행 전체가 `needs_input`이어도 선택하지 않은 요구사항의 질문만 남았다면 선택한 범위를 별도로 확인합니다.
+
+기본 실행은 별도 브랜치의 로컬 커밋과 결과물을 만듭니다. Draft PR까지 게시하려면 `approve-plan`에서 `--allow-pr`를 포함하고 `implement`에서 `--publish`를 지정합니다. 테스트 통과는 수용 기준 전체를 증명하지 않습니다. 자동 검증과 수동 확인이 필요한 항목을 보고서에서 구분해 확인하세요.
+
+대상 저장소 준비, 비용 제한, 재개 방법과 파일 형식은 [계획·구현 사용 가이드](docs/plan-implement.md)에 있습니다. 가계부 Slack 연결만으로 가계부 애플리케이션의 코드 저장소가 자동으로 선택되지는 않습니다.
+
 ## 저장되는 데이터
 
 설정한 `storageDir`에 `history.sqlite`와 실행별 결과를 저장합니다.
@@ -141,7 +182,9 @@ node dist/cli.js show '<runId>' --config project.json
 
 실행별 파일은 `runs/<runId>/` 아래에 있습니다. 부분 수집이나 실패한 실행에는 결과물이 일부만 남을 수 있으므로 파일 존재만으로 완료를 판단하지 말고 `history` 또는 `show`의 상태를 확인합니다. 초기 `metadata.json`의 검토 상태는 생성 당시의 값이며 최신 검토 이력은 `show`로 확인합니다.
 
-모델이 반환한 토큰 사용량은 `metadata.json`의 `usage`에 기록하며, 파일 재생처럼 사용량이 없으면 `null`입니다. 비용은 추정하지 않으며 `cost`는 `null`입니다.
+`analyze` 모델이 반환한 토큰 사용량은 `metadata.json`의 `usage`에 기록하며, 파일 재생처럼 사용량이 없으면 `null`입니다. 분석 메타데이터의 `cost`는 `null`입니다. `plan`·`implement`의 유료 호출은 별도의 지속성 예산 기록으로 호출 전 한도를 확인하고 사용량 기반 추정 비용을 남깁니다. 이 제한은 기존 `analyze` 호출에는 적용되지 않습니다.
+
+계획·구현 실행에는 `plan.json`, `plan.md`, `context.json`, `changes.json`, `patch.diff`, `baseline.json`, `verification.json`, 구현 보고서 등이 추가됩니다. SQLite는 계획과 허가, 구현 단계 및 재개에 필요한 기록을 보존합니다. 각 파일의 의미는 [구현 결과물 안내](docs/plan-implement.md#결과물과-실행-이력)를 확인하세요.
 
 저장 경로에는 Slack 원문이 포함됩니다. `.env`, 기본 `.slack-dev/` 실행 데이터와 SQLite 파일은 Git 추적 대상에서 제외합니다. `storageDir`를 다른 경로로 바꾸면 해당 디렉터리도 `.gitignore`에 추가해야 합니다. MVP의 로컬 저장소는 암호화·보존 기간 관리·원격 감사 서버를 제공하지 않습니다. 메시지 수정 후 재수집하면 내용 해시가 달라져 새 분석으로 처리하며, 기존 실행은 당시 원문 버전을 보존합니다.
 
@@ -155,7 +198,7 @@ npm run build
 npm run check
 ```
 
-자동 테스트는 Slack과 모델 호출을 대체해 네트워크·비밀 키 없이 실행합니다. 수집 페이지 처리, 권한 범위, 부분 수집, 잘못된 근거, 분석 스키마, 이력과 재실행 동작을 검증합니다. GitHub Actions에서도 Node.js 24로 전체 검사와 합성 CLI 예제를 실행합니다.
+자동 테스트는 Slack과 모델 호출을 대체해 네트워크·비밀 키 없이 실행합니다. 수집 페이지 처리, 권한 범위, 부분 수집, 잘못된 근거, 분석 스키마, 이력과 재실행 동작을 검증합니다. 계획·구현은 버전과 허가, 변경 파일 범위, 예산, 테스트 실패와 재개 경로도 검증합니다. GitHub Actions에서도 Node.js 24로 검사를 실행합니다.
 
 실제 워크스페이스와 API 키를 사용하는 검증은 별도 단계입니다. 작은 스레드 하나로 권한·페이지 처리·원문 링크·요구사항 품질을 먼저 확인한 뒤 사용 범위를 넓히세요.
 

@@ -18,6 +18,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Verify plan and implement in an isolated Docker fixture
+        run: |
+          docker pull node:24-alpine
+          npm run smoke:development
       - name: Run synthetic offline example
         run: |
           node dist/cli.js analyze 'https://example.slack.com/archives/CDEMO12345/p1795046400000001' --config examples/project.json --snapshot examples/thread.json --analysis-file examples/analysis.json

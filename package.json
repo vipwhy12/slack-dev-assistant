@@ -1,6 +1,6 @@
 {
   "name": "slack-dev-assistant",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Evidence-linked Slack discussion analysis for developers",
   "private": true,
   "type": "module",
@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "smoke:development": "npm run build && node scripts/smoke-development.mjs"
   },
   "dependencies": {
     "@slack/web-api": "^8.4.0",
