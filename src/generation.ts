@@ -19,7 +19,7 @@ export type ChangeSet = z.infer<typeof changeSetSchema>;
 
 /** Reject recognizable credentials even when they occur in comments or generated fixtures. */
 export function containsCredential(value: string): boolean {
-  return /(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})|AKIA[0-9A-Z]{16}|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|(?:OPENAI_API_KEY|SLACK_(?:BOT_|USER_)?TOKEN|GITHUB_TOKEN|GH_TOKEN)\s*[=:]\s*["']?(?!\$|process\.|os\.|YOUR_|your_|<|\{)[A-Za-z0-9_/-]{16,})/.test(value);
+  return /(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})|AKIA[0-9A-Z]{16}|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|(?:OPENAI_API_KEY|SLACK_(?:BOT_|USER_|APP_)?TOKEN|GITHUB_TOKEN|GH_TOKEN)\s*[=:]\s*["']?(?!\$|process\.|os\.|YOUR_|your_|<|\{)[A-Za-z0-9_/-]{16,})/.test(value);
 }
 
 export function validateChanges(input: unknown, plan: PlanDraft, context: RepositoryContext, config: ProjectConfig): ChangeSet {
@@ -142,16 +142,15 @@ export class StructuredGenerator {
   usage?: GenerationUsage;
   private readonly client: GenerationClient;
   constructor(private readonly config: ProjectConfig, options: GenerationOptions = {}) {
-    if (config.model !== VERIFIED_MODEL) throw new Error('Paid planning and implementation currently require the verified model gpt-4.1-mini');
-    if (!config.development) throw new Error('Generation requires development configuration');
+    if (config.model !== VERIFIED_MODEL) throw new Error('Paid workflows currently require the verified model gpt-4.1-mini');
     this.client = options.client ?? new OpenAI({ apiKey: options.apiKey, baseURL: 'https://api.openai.com/v1', maxRetries: 0, timeout: 120_000 });
   }
   async generate(schema: z.ZodType, phase: string, instructions: string, data: unknown): Promise<unknown> {
     this.usage = undefined;
     const input = JSON.stringify(data);
-    if (Buffer.byteLength(input, 'utf8') > this.config.development!.maxContextBytes + 131_072) throw new Error('Generation input exceeds the context limit');
+    if (Buffer.byteLength(input, 'utf8') > (this.config.development?.maxContextBytes ?? 98_304) + 131_072) throw new Error('Generation input exceeds the context limit');
     if (containsCredential(input)) throw new Error('Generation context contains a possible credential');
-    const ledger = new BudgetLedger(this.config.storageDir, this.config.development!.budgetUsd);
+    const ledger = new BudgetLedger(this.config.storageDir, this.config.development?.budgetUsd ?? 10);
     try {
       const id = ledger.reserve(phase);
       const response = await this.client.responses.parse({ model: this.config.model, instructions, input, store: false,

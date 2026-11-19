@@ -23,6 +23,15 @@ export const developmentSchema = z.object({
   budgetUsd: z.number().positive().max(10).default(10),
 }).strict();
 
+export const slackAppSchema = z.object({
+  teamId: z.string().regex(/^T[A-Z0-9]+$/),
+  appId: z.string().regex(/^A[A-Z0-9]+$/),
+  command: z.string().regex(/^\/[a-z0-9_-]+$/).default('/duduk'),
+  allowedUserIds: z.array(z.string().regex(/^[UW][A-Z0-9]+$/)).min(1),
+  approverUserIds: z.array(z.string().regex(/^[UW][A-Z0-9]+$/)).min(1),
+}).strict().refine(policy => policy.approverUserIds.every(id => policy.allowedUserIds.includes(id)),
+  'Every approver must also be an allowed user');
+
 export const configSchema = z.object({
   projectId: z.string().regex(/^[a-zA-Z0-9_-]+$/),
   slack: z.object({
@@ -33,6 +42,7 @@ export const configSchema = z.object({
   repoPath: z.string().min(1).optional(),
   model: z.string().min(1),
   development: developmentSchema.optional(),
+  slackApp: slackAppSchema.optional(),
   github: z.object({
     repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
     baseBranch: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/).refine(value => !value.includes('..') && !value.endsWith('/')).default('main'),

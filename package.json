@@ -19,6 +19,7 @@
     "smoke:development": "npm run build && node scripts/smoke-development.mjs"
   },
   "dependencies": {
+    "@slack/socket-mode": "^3.2.0",
     "@slack/web-api": "^8.4.0",
     "commander": "^15.1.0",
     "dotenv": "^18.0.10",

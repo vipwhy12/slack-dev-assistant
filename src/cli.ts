@@ -5,7 +5,10 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { userInfo } from 'node:os';
 import { loadConfig } from './config.js';
-import { OpenAIAnalyzer } from './analysis.js';
+import { BudgetedAnalyzer } from './budgeted-analysis.js';
+import { saveKnowledge, queryKnowledge } from './knowledge-workflow.js';
+import { FileKnowledgeExtractor, OpenAIKnowledgeExtractor } from './knowledge.js';
+import { serveSlack } from './slack-runtime.js';
 import { createSlackClient, collectThread } from './slack.js';
 import { analyzeThread, FileAnalyzer, reviewRun, safeError } from './workflow.js';
 import { RunStore } from './store.js';
@@ -40,7 +43,7 @@ program.command('analyze').argument('<thread-url>', 'allowed Slack thread permal
     const config = loadConfig(options.config);
     if (!options.snapshot && !process.env.SLACK_TOKEN) throw new Error('SLACK_TOKEN is required for live Slack collection.');
     if (!options.analysisFile && !process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is required for live analysis.');
-    const analyzer = options.analysisFile ? new FileAnalyzer(options.analysisFile) : new OpenAIAnalyzer({ model: config.model });
+    const analyzer = options.analysisFile ? new FileAnalyzer(options.analysisFile) : new BudgetedAnalyzer(config, threadUrl);
     const result = await analyzeThread({ config, threadUrl, analyzer, force: options.force,
       collect: options.snapshot
         ? async () => JSON.parse(readFileSync(options.snapshot!, 'utf8'))
@@ -48,6 +51,33 @@ program.command('analyze').argument('<thread-url>', 'allowed Slack thread permal
     });
     json(result);
     if (!result.reportPath) process.exitCode = 2;
+  });
+program.command('save').argument('<thread-url>').addOption(configOption())
+  .description('Normalize domain knowledge with exact source evidence into SQLite')
+  .option('--snapshot <path>', 'replay a collected thread without Slack calls')
+  .option('--knowledge-file <path>', 'replay a knowledge draft without model calls')
+  .action(async (threadUrl: string, options: {config: string; snapshot?: string; knowledgeFile?: string}) => {
+    const config = loadConfig(options.config);
+    if (!options.snapshot && !process.env.SLACK_TOKEN) throw new Error('SLACK_TOKEN is required for live collection.');
+    json(await saveKnowledge({ config, threadUrl,
+      extractor: options.knowledgeFile ? new FileKnowledgeExtractor(options.knowledgeFile) : new OpenAIKnowledgeExtractor(config),
+      collect: options.snapshot ? async () => JSON.parse(readFileSync(options.snapshot!, 'utf8'))
+        : () => collectThread(threadUrl, config.slack, createSlackClient(process.env.SLACK_TOKEN!)),
+    }));
+  });
+program.command('knowledge').argument('[query]', 'literal search text', '').addOption(configOption())
+  .option('--limit <count>', 'maximum results (1–200)', '20')
+  .description('Search current unreviewed knowledge and exact source evidence')
+  .action((query: string, options: {config: string; limit: string}) => {
+    json(queryKnowledge(loadConfig(options.config), query, Number(options.limit)));
+  });
+program.command('serve-slack').addOption(configOption())
+  .description('Listen for /duduk commands and review actions using Socket Mode')
+  .action(async (options: {config: string}) => {
+    const server = await serveSlack(loadConfig(options.config));
+    process.stdout.write('Slack Socket Mode connected. Keep this process running to receive commands.\n');
+    const stop = () => { void server.stop().catch(error => { process.stderr.write(`${safeError(error).message}\n`); process.exitCode = 1; }); };
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
   });
 program.command('history').addOption(configOption()).option('--limit <count>', 'maximum records (1–1000)', '20')
   .action((options: {config: string; limit: string}) => {
@@ -106,7 +136,7 @@ program.command('implement').argument('<plan-id>').addOption(configOption())
     };
     json(await implementPlan({ config, planId, grantId: options.grant, implementer, publish: options.publish, resumeRunId: options.resume }));
   });
-program.command('budget').addOption(configOption()).description('Show cumulative planning/implementation API reservations and estimated usage')
+program.command('budget').addOption(configOption()).description('Show cumulative save/analyze/plan/implement API reservations and estimated usage')
   .action((options: {config: string}) => {
     const config = loadConfig(options.config);
     const ledger = new BudgetLedger(config.storageDir, config.development?.budgetUsd ?? 10);

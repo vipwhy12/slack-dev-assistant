@@ -1,10 +1,51 @@
 # slack-dev-assistant
 
-Slack 스레드의 논의를 원문 근거가 연결된 개발 요구사항으로 정리하고, 검토한 요구사항으로 구현 계획·코드 변경·테스트·Draft PR을 만드는 TypeScript/Node.js CLI입니다. `analyze → review → plan → approve-plan → implement` 순서로 실행합니다. 요구사항의 논의 상태, 사람의 검토, 구현 허가를 별도로 기록합니다.
+Slack 스레드에서 도메인 지식을 저장하거나 개발 요구사항을 분석하고, 검토한 요구사항으로 구현 계획·코드 변경·테스트·Draft PR을 만드는 TypeScript/Node.js 도구입니다. Slack 명령어와 로컬 CLI를 제공하며, 요구사항의 논의 상태·사람의 검토·구현 허가를 별도로 기록합니다.
+
+## Slack에서 사용하기
+
+```text
+/duduk save <스레드 링크>
+/duduk analyze <스레드 링크>
+```
+
+- **`save`**: 대화에 나온 도메인 지식을 추출해 SQLite에 정규화해 저장합니다. 원문 인용·링크와 연결하며, 추출 결과는 사람이 검토하기 전의 주장으로 보존합니다.
+- **`analyze`**: 구현할 요구사항·완료 조건·질문을 정리합니다. 사람이 요구사항을 검토하고 계획을 승인하면 기존 구현 파이프라인으로 코드 수정·테스트·Draft PR 생성까지 진행합니다.
+
+```mermaid
+flowchart LR
+  S[Slack 스레드] --> K[save: 지식 추출·원문 검증]
+  K --> DB[(SQLite 지식 저장)]
+  DB -. 같은 채널의 검토 전 참고 정보 .-> A
+  S --> A[analyze: 요구사항·질문]
+  A --> R[사람의 요구사항 검토]
+  R --> P[구현 계획]
+  P --> G[사람의 구현·PR 승인]
+  G --> I[별도 worktree에서 코드 변경]
+  I --> T[Docker 테스트]
+  T --> PR[Draft PR]
+  PR --> H[사람의 PR 검토·병합]
+  H --> CI[main 커밋 테스트·빌드]
+  CI --> D[설정된 GitHub CI에서 NCP 배포]
+```
+
+명령은 **스레드 답글창이 아닌 해당 채널의 기본 입력창**에 입력합니다. 같은 채널의 스레드 링크만 받습니다. Socket Mode 작업 프로세스가 켜져 있어야 하며, 스레드 수집은 명령 실행 시에만 수행합니다. 새 메시지를 실시간으로 수집하거나 새 글만 보고 개발을 시작하지 않습니다. 서버 모드에서는 이 앱이 작성한 결과 메시지를 원문에서 제외해 다음 분석에 다시 섞이지 않도록 합니다.
+
+Slack 도구의 실행 범위는 Draft PR까지입니다. 사람의 병합 뒤 CI 검증·NCP 배포를 연결하는 변경은 [duduk PR #1](https://github.com/oy-ubs4939/duduk/pull/1)에서 검토 중이며, 별도의 운영 설정이 필요합니다. [duduk 배포 가이드](https://github.com/oy-ubs4939/duduk/blob/slack-dev/duduk-connection-20261119/docs/slack-deployment.md)를 확인하세요. Slack 앱 명령어·추가 토큰 설정과 실제 운영 배포는 코드 구현 완료와 별개의 활성화 단계입니다.
+
+앱 설치·토큰·허용 사용자 설정 후 실행합니다. 기존 읽기 전용 앱에는 권한 추가와 재설치가 필요합니다.
+
+```sh
+node dist/cli.js serve-slack --config slack-dev.config.json
+```
+
+자세한 절차는 [Slack 명령어 연결 가이드](docs/slack-commands.md)에 있습니다. 코드가 설치되어 있어도 Slack 앱과 로컬 작업 프로세스 설정을 마쳐야 명령어가 동작합니다.
 
 ## 구현 범위
 
 - Slack Web API를 통한 스레드 수집, 페이지 처리, 메시지 버전과 원문 링크 보존
+- Slack Socket Mode의 `/duduk save`, `/duduk analyze`와 사람의 검토·승인
+- SQLite의 도메인 지식·관계·원문 근거 저장과 검색
 - 프로젝트별 Slack 워크스페이스·채널 허용 범위 확인
 - Zod 기반 요구사항·질문·수용 기준 스키마 및 원문 인용 검증
 - `confirmed`, `proposed`, `open`, `rejected`, `superseded` 구분
@@ -16,7 +57,7 @@ Slack 스레드의 논의를 원문 근거가 연결된 개발 요구사항으�
 - 선택적으로 푸시·GitHub Draft PR 생성
 - 네트워크와 API 키가 필요 없는 합성 예제 및 자동 테스트
 
-명령을 실행할 때 처리하는 로컬 도구입니다. Slack 새 메시지를 상시 감지하지 않으며 PR 병합이나 배포를 수행하지 않습니다. `implement`는 모델이 제안한 구조화된 파일 변경만 적용하고, 설정된 테스트 명령만 Docker 안에서 실행합니다.
+명시적인 Slack 명령어 또는 로컬 CLI 명령으로 작업을 시작합니다. `implement`는 모델이 제안한 구조화된 파일 변경만 적용하고, 설정된 테스트 명령만 Docker 안에서 실행합니다.
 
 ## 시작하기
 
@@ -45,9 +86,9 @@ node dist/cli.js history --config examples/project.json --limit 20
 
 ## 실제 Slack 연결
 
-1. Slack 앱을 만들고 대상 워크스페이스에 설치합니다. 공개 개발 채널만 읽는 봇은 [`examples/slack-app-manifest.json`](examples/slack-app-manifest.json)으로 만들 수 있습니다. 이 매니페스트는 `channels:history` 하나만 요청합니다. 설치한 봇을 읽을 채널에 추가합니다.
+1. Slack 앱을 만들고 대상 워크스페이스에 설치합니다. [`examples/slack-app-manifest.json`](examples/slack-app-manifest.json)은 공개 채널 읽기·응답과 `/duduk` 명령어에 필요한 `channels:history`, `chat:write`, `commands`를 요청하고 Socket Mode를 활성화합니다. 설치한 봇을 사용할 채널에 추가합니다. 로컬 수집·분석만 사용할 때는 기존 읽기 전용 토큰으로도 동작합니다.
 2. 대상 채널 스레드를 읽을 수 있는 OAuth 토큰을 준비합니다. 공개 채널은 `channels:history`, 비공개 채널은 `groups:history` 권한과 대상 채널 접근 권한이 필요합니다. 현재 `conversations.replies` 공식 문서는 봇·사용자 토큰을 지원 대상으로 안내합니다. 실제 토큰과 채널 조합은 작은 스레드로 먼저 확인하세요.
-3. `.env.example`을 `.env`로 복사하고 `SLACK_TOKEN`, `OPENAI_API_KEY`를 설정합니다. `.env`는 CLI를 실행하는 현재 디렉터리에서 읽습니다.
+3. `.env.example`을 `.env`로 복사하고 `SLACK_TOKEN`, `OPENAI_API_KEY`를 설정합니다. Slack 명령어를 받으려면 별도의 `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`도 설정합니다. [.env 설정](docs/slack-commands.md#2-토큰-설정)을 확인하세요. `.env`는 CLI를 실행하는 현재 디렉터리에서 읽습니다.
 4. 프로젝트 설정에서 실제 워크스페이스와 허용 채널을 지정합니다. 설정 파일에 토큰을 넣지 않습니다.
 
 ```json
@@ -63,7 +104,7 @@ node dist/cli.js history --config examples/project.json --limit 20
 }
 ```
 
-`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 분석에서는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 계획·구현에서는 변경할 Git 저장소의 경로로 반드시 지정합니다. `analyze` 모델은 계정에서 사용 가능한 구조화 출력 지원 모델로 변경할 수 있습니다. 비용을 계산하는 `plan`·`implement`의 모델 지원 범위는 [구현 가이드](docs/plan-implement.md)를 확인하세요.
+`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 분석에서는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 계획·구현에서는 변경할 Git 저장소의 경로로 반드시 지정합니다. 현재 CLI·Slack의 유료 `save`·`analyze`·`plan`·`implement`는 비용 계산을 지원하는 `gpt-4.1-mini`만 허용합니다. `save`·`analyze`는 `development` 설정 없이도 사용할 수 있습니다.
 
 ```sh
 node dist/cli.js analyze \
@@ -88,6 +129,10 @@ node dist/cli.js collect '<Slack 스레드 URL>' --config slack-dev.config.json
 | --- | --- |
 | `doctor --config <file>` | Slack 인증 및 워크스페이스 일치를 확인합니다. LLM 키는 필요하지 않습니다. |
 | `collect <thread-url> --config <file>` | LLM 없이 스레드 원문과 링크를 수집합니다. 부분 수집 시 종료 코드 2를 반환합니다. |
+| `serve-slack --config <file>` | Socket Mode로 `/duduk` 명령어와 검토·승인 입력을 받습니다. 프로세스를 계속 실행해야 합니다. |
+| `save <thread-url> --config <file>` | 스레드의 도메인 지식을 원문 근거와 함께 정규화해 저장합니다. |
+| `save ... --snapshot <file> --knowledge-file <file>` | 저장한 스냅샷과 지식 추출 JSON으로 Slack·모델 호출을 대체합니다. |
+| `knowledge [query] --limit <n> --config <file>` | 저장된 프로젝트 지식을 조회·검색합니다. |
 | `analyze <thread-url> --config <file>` | Slack 스레드를 수집하고 요구사항을 분석합니다. |
 | `analyze ... --snapshot <file>` | 검증된 스냅샷 파일로 Slack 수집을 대체합니다. |
 | `analyze ... --analysis-file <file>` | Zod 스키마의 JSON 파일로 모델 호출을 대체합니다. 원문 검증은 그대로 수행합니다. |
@@ -104,7 +149,7 @@ node dist/cli.js collect '<Slack 스레드 URL>' --config slack-dev.config.json
 | `implement ... --changes-file <file>` | 모델 대신 구조화된 파일 변경 JSON을 검증해 사용합니다. |
 | `implement ... --publish` | 검증한 커밋을 허가된 GitHub 저장소에 푸시하고 Draft PR을 만듭니다. |
 | `implement ... --resume <implementationRunId>` | 저장한 실행 체크포인트에서 검증·게시를 이어갑니다. |
-| `budget --config <file>` | 계획·구현 API의 누적 예약·추정 사용액과 한도를 조회합니다. |
+| `budget --config <file>` | 같은 저장 경로에서 기록한 지식 저장·분석·계획·구현 API의 누적 예약·추정 사용액과 한도를 조회합니다. |
 
 `--snapshot`은 스키마, 스레드 식별자와 메시지 원문 링크를 검증한 뒤 실제 내용으로 `contentHash`를 다시 계산합니다. 파일에 들어 있는 기존 해시를 무결성 서명으로 신뢰하지 않습니다. `--analysis-file`은 `examples/analysis.json`과 같은 분석 객체를 받습니다. 실행 결과 전체를 그대로 넣는 형식은 아닙니다.
 
@@ -172,21 +217,38 @@ node dist/cli.js implement '<planId>' \
 
 ## 저장되는 데이터
 
-설정한 `storageDir`에 `history.sqlite`와 실행별 결과를 저장합니다.
+설정한 `storageDir`에 다음 SQLite 파일과 결과물을 저장합니다. 각 기능을 사용하면 해당 기록이 생성됩니다.
+
+| 파일 | 저장하는 내용 |
+| --- | --- |
+| `history.sqlite` | 분석·계획·구현 실행과 단계·오류, 프로젝트 설정, 불변 스레드 스냅샷·메시지 버전, 모델 초안·사람 검토 버전·개입 기록, 계획의 기준 커밋·내용, 실행 허가와 구현 체크포인트 |
+| `knowledge.sqlite` | 프로젝트·워크스페이스·채널·스레드, 수집 스냅샷과 메시지 버전, 추출 실행, 용어·엔티티·규칙·사실·결정, 항목 간 관계, 각 항목·관계의 원문 인용, 미해결 사항을 구분한 정규화 테이블 |
+| `slack-jobs.sqlite` | Slack 요청의 식별자·사용자·채널·스레드·작업 상태·입출력, 한 번만 사용할 수 있는 검토·승인 동작과 내용 해시, 작업자 잠금. 토큰이나 Slack 응답 URL은 저장하지 않음 |
+| `budget.sqlite` | 유료 모델 호출 전 비용 예약과 단계·모델, 응답에서 확인한 토큰 사용량·추정 비용·요청 ID |
+
+지식 항목은 항상 `unreviewed`입니다. 원문에 명시된 주장(`stated`)과 불확실한 주장(`uncertain`)을 구분하며, 같은 종류·정규화 키의 현재 항목에 다른 내용이 있으면 충돌 가능성(`conflicting`)을 표시합니다. 의미가 비슷한 모든 모순을 탐지하는 기능은 아닙니다. 원문이 바뀌면 이전 버전을 보존하고, 검색은 해당 프로젝트·허용 워크스페이스·채널에서 각 스레드의 최신 수집본에 연결된 항목만 반환합니다. 내용이 바뀐 새 수집본이 불완전하거나 추출에 실패하면 이전 지식을 최신 사실처럼 노출하지 않습니다.
+
+`analyze`는 같은 채널의 현재 지식을 최대 20개·32 KiB 이내에서 참고합니다. 전달하는 내용은 항목의 제목·주장·상태·원문 인용이며, 관계 전체나 저장된 모든 미해결 사항을 전송하지 않습니다. 이 참고 내용의 해시는 분석 캐시에 포함하고 `knowledge-context.json`으로도 남깁니다. 분석 요구사항의 근거는 여전히 **현재 스레드의 원문**이어야 합니다.
+
+분석 실행별 파일은 `runs/<runId>/` 아래에 있습니다.
 
 - `snapshot.json`: 수집 당시 메시지와 버전·원문 링크·수집 경고
 - `analysis.json`: 검증된 구조화 분석
 - `report.md`: 사람이 읽을 수 있는 요구사항과 근거 보고서
 - `metadata.json`: 입력·스키마·프롬프트·모델·Git 버전, 초기 검토 상태와 모델 토큰 사용량
-- SQLite: 실행 상태, 단계, 오류, 설정·모델·프롬프트·Git 정보 및 검토 이력
+- `knowledge-context.json`: 해당 분석에서 참고한 지식 항목과 출처의 고정 사본
 
-실행별 파일은 `runs/<runId>/` 아래에 있습니다. 부분 수집이나 실패한 실행에는 결과물이 일부만 남을 수 있으므로 파일 존재만으로 완료를 판단하지 말고 `history` 또는 `show`의 상태를 확인합니다. 초기 `metadata.json`의 검토 상태는 생성 당시의 값이며 최신 검토 이력은 `show`로 확인합니다.
+지식 추출 보고서는 `knowledge/<knowledgeSetId>/` 아래의 `snapshot.json`, `knowledge.json`, `report.md`에 저장합니다. 부분 수집이나 실패한 실행에는 결과물이 일부만 남을 수 있으므로 파일 존재만으로 완료를 판단하지 말고 `history`·`show` 또는 Slack의 `status`를 확인합니다. 초기 `metadata.json`의 검토 상태는 생성 당시의 값이며 최신 검토 이력은 `show`로 확인합니다.
 
-`analyze` 모델이 반환한 토큰 사용량은 `metadata.json`의 `usage`에 기록하며, 파일 재생처럼 사용량이 없으면 `null`입니다. 분석 메타데이터의 `cost`는 `null`입니다. `plan`·`implement`의 유료 호출은 별도의 지속성 예산 기록으로 호출 전 한도를 확인하고 사용량 기반 추정 비용을 남깁니다. 이 제한은 기존 `analyze` 호출에는 적용되지 않습니다.
+현재 CLI·Slack의 유료 `save`·`analyze`·`plan`·`implement`는 **같은 `storageDir/budget.sqlite`의 누적 예산**을 공유합니다. 기본 한도는 $10이며 `development.budgetUsd`로 더 낮게 설정할 수 있습니다. 호출 전에 최대 비용을 예약하고, 사용량을 확인한 응답은 추정 비용으로 정산합니다. 사용량이 불명확하면 예약액을 유지합니다. 한도를 넘을 수 있는 호출은 보내지 않습니다. `budget`으로 현재 예약·추정 사용액을 확인하세요.
+
+이 예산은 해당 파일에 기록된 호출에만 적용됩니다. 과거 별도 테스트·이전 분석 어댑터·다른 프로그램의 사용료나 다른 `storageDir`의 호출은 합산하지 않으며, OpenAI 계정 전체의 결제 한도를 설정하지 않습니다. 분석 메타데이터의 `cost` 필드는 호환성을 위해 `null`이고, 현재 어댑터의 추정 비용은 `usage.estimatedCostUsd`와 예산 DB에서 확인합니다. 파일 재생은 API를 호출하지 않습니다.
 
 계획·구현 실행에는 `plan.json`, `plan.md`, `context.json`, `changes.json`, `patch.diff`, `baseline.json`, `verification.json`, 구현 보고서 등이 추가됩니다. SQLite는 계획과 허가, 구현 단계 및 재개에 필요한 기록을 보존합니다. 각 파일의 의미는 [구현 결과물 안내](docs/plan-implement.md#결과물과-실행-이력)를 확인하세요.
 
 저장 경로에는 Slack 원문이 포함됩니다. `.env`, 기본 `.slack-dev/` 실행 데이터와 SQLite 파일은 Git 추적 대상에서 제외합니다. `storageDir`를 다른 경로로 바꾸면 해당 디렉터리도 `.gitignore`에 추가해야 합니다. MVP의 로컬 저장소는 암호화·보존 기간 관리·원격 감사 서버를 제공하지 않습니다. 메시지 수정 후 재수집하면 내용 해시가 달라져 새 분석으로 처리하며, 기존 실행은 당시 원문 버전을 보존합니다.
+
+Slack 작업자가 실행 도중 중단되면 작업을 `needs_resume`으로 남기고 자동 재실행하지 않습니다. 기존 구현 실행의 체크포인트를 확인한 뒤 로컬 `implement ... --resume <runId>`로 복구합니다. 지식 추출의 응답·과금 여부가 불명확한 실패도 같은 입력으로 자동 재호출하지 않습니다. 구체적인 확인·복구 절차는 [Slack 연결 가이드](docs/slack-commands.md#8-비용과-실패-복구)에 있습니다.
 
 ## 개발과 검증
 

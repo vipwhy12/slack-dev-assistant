@@ -57,7 +57,7 @@ function checkPlan(store: RunStore, config: ProjectConfig, planId: string, execu
   return { record, ...source, context, requirementIds, plan };
 }
 
-export interface PlanOptions { config: ProjectConfig; sourceRunId: string; planner: Planner; requirementIds?: string[]; force?: boolean }
+export interface PlanOptions { config: ProjectConfig; sourceRunId: string; planner: Planner; requirementIds?: string[]; force?: boolean; expectedRevisionId?: string }
 export async function planRun(options: PlanOptions) {
   const { config, planner } = options;
   requireDevelopment(config);
@@ -67,6 +67,7 @@ export async function planRun(options: PlanOptions) {
   try {
     store.acquireLock();
     const { snapshot, revision, analysis } = sourceAnalysis(store, config, options.sourceRunId);
+    if (options.expectedRevisionId && revision.id !== options.expectedRevisionId) throw new Error('Reviewed analysis changed before planning.');
     const requirementIds = options.requirementIds ?? analysis.requirements.filter(r => !['rejected', 'superseded'].includes(r.decisionState)).map(r => r.id);
     if (requirementIds.length === 0 || new Set(requirementIds).size !== requirementIds.length || requirementIds.some(id => !analysis.requirements.some(r => r.id === id))) throw new Error('Select one or more unique known requirement IDs.');
     store.saveProject(config.projectId, config, hash(config));
@@ -111,11 +112,12 @@ export async function planRun(options: PlanOptions) {
   } finally { store.close(); }
 }
 
-export function approvePlan(config: ProjectConfig, planId: string, reason: string, actor: string, allowPr = false) {
+export function approvePlan(config: ProjectConfig, planId: string, reason: string, actor: string, allowPr = false, expectedBindingHash?: string) {
   const store = openStore(config);
   try {
     store.acquireLock();
     const { record, plan } = checkPlan(store, config, planId, true);
+    if (expectedBindingHash && record.binding_hash !== expectedBindingHash) throw new Error('Plan changed after approval.');
     // Check uncommitted target changes before issuing a grant, not merely HEAD.
     inspectRepository(config);
     if (allowPr && !config.github) throw new Error('PR permission requires github repository/baseBranch/remote configuration.');
@@ -307,4 +309,11 @@ export async function implementPlan(options: ImplementOptions) {
     if (runId) store.status(runId, 'failed', failure);
     throw new Error(`${failure.message}${runId ? ` (run: ${runId})` : ''}`);
   } finally { store.close(); }
+}
+
+/** Revalidate the exact stored plan before exposing approval controls. */
+export function inspectStoredPlan(config: ProjectConfig, planId: string) {
+  const store = new RunStore(join(config.storageDir, 'history.sqlite'), 250);
+  try { store.acquireLock(); return checkPlan(store, config, planId, false); }
+  finally { store.close(); }
 }

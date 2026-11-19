@@ -26,11 +26,12 @@ const now = () => new Date().toISOString();
 export class RunStore {
   private db: DatabaseSync;
   private lockId?: string;
-  constructor(path: string) {
+  constructor(path: string, busyTimeoutMs = 5000) {
+    if (!Number.isInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 5000) throw new Error('Invalid database busy timeout');
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     chmodSync(path, 0o600);
-    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
+    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${busyTimeoutMs}; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, config_json TEXT NOT NULL, config_hash TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs(
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), mode TEXT NOT NULL,

@@ -1,0 +1,37 @@
+{
+  "summary": "주문 내보내기의 형식과 인코딩 결정",
+  "items": [
+    {
+      "id": "K1",
+      "kind": "decision",
+      "key": "export.format",
+      "title": "첫 버전 내보내기 형식",
+      "statement": "첫 버전은 CSV만 제공하며 XLSX는 제외한다.",
+      "certainty": "stated",
+      "evidence": [
+        {
+          "messageVersionId": "demo-message-2-v1",
+          "quote": "첫 버전은 CSV 내보내기만 제공합니다. XLSX 내보내기는 이번 범위에서 제외합니다."
+        }
+      ]
+    },
+    {
+      "id": "K2",
+      "kind": "rule",
+      "key": "export.encoding",
+      "title": "CSV 인코딩",
+      "statement": "CSV 파일은 UTF-8로 인코딩한다.",
+      "certainty": "stated",
+      "evidence": [
+        {
+          "messageVersionId": "demo-message-4-v1",
+          "quote": "CSV 파일은 UTF-8이어야 합니다."
+        }
+      ]
+    }
+  ],
+  "relationships": [],
+  "uncertainties": [
+    "날짜 열의 시간대는 아직 확정하지 않았다."
+  ]
+}

@@ -1,6 +1,6 @@
 # 계획·구현 사용 가이드
 
-`plan`은 Slack 분석과 저장소 파일을 읽어 변경 계획을 만듭니다. `implement`는 허가된 계획으로 별도 Git worktree의 파일을 수정하고 Docker 안에서 테스트합니다. 옵션을 지정하면 GitHub에 Draft PR까지 만듭니다. 모든 단계는 로컬 터미널에서 명령을 실행할 때 진행됩니다.
+`plan`은 Slack 분석과 저장소 파일을 읽어 변경 계획을 만듭니다. `implement`는 허가된 계획으로 별도 Git worktree의 파일을 수정하고 Docker 안에서 테스트합니다. 옵션을 지정하면 GitHub에 Draft PR까지 만듭니다. 각 단계는 로컬 CLI 또는 Slack Socket Mode 작업 프로세스에서 진행됩니다.
 
 ```mermaid
 flowchart LR

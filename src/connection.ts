@@ -10,6 +10,7 @@ export interface SlackAuthResponse {
   url?: string;
   team_id?: string;
   user_id?: string;
+  bot_id?: string;
 }
 export interface SlackAuthApi { auth: { test(): Promise<SlackAuthResponse> } }
 export interface ConnectionCheck {
@@ -18,6 +19,7 @@ export interface ConnectionCheck {
   workspaceUrl: string;
   teamId: string;
   userId: string;
+  botId?: string;
 }
 export interface CollectionResult {
   snapshotId: string;
@@ -77,7 +79,8 @@ export async function checkConnection(config: ProjectConfig, token: string, clie
       typeof response.user_id !== 'string' || !/^[UW][A-Z0-9]+$/.test(response.user_id)) {
     throw new Error('Slack authentication response is missing a valid team or user identity.');
   }
-  return { authenticated: true, workspace: config.slack.workspace, workspaceUrl, teamId: response.team_id, userId: response.user_id };
+  return { authenticated: true, workspace: config.slack.workspace, workspaceUrl, teamId: response.team_id, userId: response.user_id,
+    ...(response.bot_id && /^B[A-Z0-9]+$/.test(response.bot_id) ? { botId: response.bot_id } : {}) };
 }
 
 /** Collect source evidence locally without initializing an analyzer or contacting an LLM. */
