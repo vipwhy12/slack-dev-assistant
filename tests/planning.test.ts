@@ -160,7 +160,7 @@ describe('planner adapters and report', () => {
     expect(request.text.format).toMatchObject({ schema: { properties: { items: { items: { properties: {
       codeRefs: { items: { required: ['path', 'startLine', 'endLine'], additionalProperties: false } },
     } } } } } });
-    expect(planner.promptVersion).toBe('planning-v5');
+    expect(planner.promptVersion).toBe('planning-v6');
     expect(parse).toHaveBeenCalledTimes(1);
   });
   it('escapes untrusted markup in human-readable plans', () => {
@@ -210,25 +210,25 @@ describe('provider line ranges become exact local code evidence', () => {
     finally { ledger.close(); }
   });
   it.each([
-    { name: 'zero start', startLine: 0, endLine: 1 },
-    { name: 'zero end', startLine: 1, endLine: 0 },
-    { name: 'negative start', startLine: -1, endLine: 1 },
-    { name: 'fractional start', startLine: 1.5, endLine: 2 },
-    { name: 'fractional end', startLine: 1, endLine: 1.5 },
-    { name: 'reverse range', startLine: 2, endLine: 1 },
-    { name: 'end beyond file', startLine: 1, endLine: 3 },
-    { name: 'start beyond file', startLine: 3, endLine: 3 },
-    { name: 'blank final line', startLine: 2, endLine: 2 },
-  ])('rejects $name without another model call', async ({ startLine, endLine }) => {
+    { name: 'zero start', startLine: 0, endLine: 1, calls: 1 },
+    { name: 'zero end', startLine: 1, endLine: 0, calls: 1 },
+    { name: 'negative start', startLine: -1, endLine: 1, calls: 1 },
+    { name: 'fractional start', startLine: 1.5, endLine: 2, calls: 1 },
+    { name: 'fractional end', startLine: 1, endLine: 1.5, calls: 1 },
+    { name: 'reverse range', startLine: 2, endLine: 1, calls: 2 },
+    { name: 'end beyond file', startLine: 1, endLine: 3, calls: 2 },
+    { name: 'start beyond file', startLine: 3, endLine: 3, calls: 2 },
+    { name: 'blank final line', startLine: 2, endLine: 2, calls: 2 },
+  ])('rejects $name with at most one schema-valid correction', async ({ startLine, endLine, calls }) => {
     const c = config(); const draft = wirePlan(); draft.items[0]!.codeRefs = [{ path: 'src/app.ts', startLine, endLine }];
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow();
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(calls);
   });
   it.each(['   \t', 'x'.repeat(16_001)])('rejects blank or oversized selected text', async content => {
     const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(wirePlan()));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: { ...context, files: [{ path: 'src/app.ts', content }] }, config: c, requirementIds: ['R1'] })).rejects.toThrow(/line range/);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
   it('accepts exactly the stored quote length limit', async () => {
     const c = config(); const content = 'x'.repeat(16_000);
@@ -241,7 +241,7 @@ describe('provider line ranges become exact local code evidence', () => {
     const scoped = { ...context, files: [...context.files, { path: 'private/app.ts', content: 'private code' }] };
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: scoped, config: c, requirementIds: ['R1'] })).rejects.toThrow(/evidence path/);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
   it('rejects omitted evidence and validates side-effect ranges by the same rules', async () => {
     const c = config(); const draft = wirePlan();
@@ -249,10 +249,10 @@ describe('provider line ranges become exact local code evidence', () => {
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     const input = { analysis: analysis(), context, config: c, requirementIds: ['R1'] };
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow(/line range/);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(2);
     parse.mockReset().mockResolvedValue(response(wirePlan()));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ ...input, context: { ...context, omittedPaths: ['src/app.ts'] } })).rejects.toThrow(/evidence path/);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
   it('rejects model-supplied quotes, forged content, and execution authority', async () => {
     const c = config(); const draft = wirePlan();
@@ -270,7 +270,7 @@ describe('provider line ranges become exact local code evidence', () => {
     const c = config(); const draft = wirePlan(); draft.items[0]!.affectedPaths = ['private/app.ts'];
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow(/write scope/);
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
   it('never retries provider failures or sends a request beyond the budget', async () => {
     const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockRejectedValue(new Error('500 provider failure'));
@@ -291,5 +291,91 @@ describe('provider line ranges become exact local code evidence', () => {
     expect(result.items[0]!.codeRefs[0]!.quote).toBe('export const enabled = false;');
     expect(JSON.parse(parse.mock.calls[0]![0].input).repository.files[0].lines[0]).toEqual({ number: 1, text: 'export const enabled = false;' });
     expect(parse).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('one bounded correction of locally invalid plans', () => {
+  const response = (output: unknown) => ({ status: 'completed', output_parsed: output, output: [],
+    usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } });
+  function missingCriterion() { const draft = wirePlan(); draft.items[0]!.acceptanceChecks = []; return draft; }
+  it('sends the complete requirement-to-criterion mapping on both calls and validates the corrected plan', async () => {
+    const c = config(); const selected = analysis();
+    selected.requirements[0]!.acceptanceCriteria.push({ id: 'A2', text: 'second behavior', origin: 'derived', sourceRefs: [] });
+    const corrected = wirePlan(); corrected.items[0]!.acceptanceChecks.push({ criterionId: 'A2', commandId: 'test', testName: 'second behavior' });
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValueOnce(response(wirePlan())).mockResolvedValueOnce(response(corrected));
+    const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
+    const result = await planner.plan({ analysis: selected, context, config: c, requirementIds: ['R1'] });
+    expect(result.items[0]!.acceptanceChecks).toEqual(corrected.items[0]!.acceptanceChecks);
+    expect(result.items[0]!.codeRefs[0]!.quote).toBe('export const enabled = false;');
+    expect(parse).toHaveBeenCalledTimes(2);
+    const first = JSON.parse(parse.mock.calls[0]![0].input), second = JSON.parse(parse.mock.calls[1]![0].input);
+    const { correction, ...unchanged } = second;
+    expect(unchanged).toEqual(first);
+    expect(first.expectedRequirementCriteria).toEqual([{ requirementId: 'R1', criterionIds: ['A1', 'A2'] }]);
+    expect(first.expectedExcludedRequirementIds).toEqual(['R2']);
+    expect(correction).toEqual({ invalidWire: wirePlan(), validationError: 'Plan must map every selected acceptance criterion exactly once' });
+    expect(parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
+    expect(parse.mock.calls[1]![0].instructions).toContain('untrusted diagnostic data');
+    expect(parse.mock.calls[1]![0]).toMatchObject({ store: false, text: { format: { name: 'implementation_plan_repair', strict: true } } });
+    expect(planner.usage).toMatchObject({ inputTokens: 200, outputTokens: 40, totalTokens: 240,
+      attempts: [expect.objectContaining({ inputTokens: 100 }), expect.objectContaining({ inputTokens: 100 })] });
+    const ledger = new BudgetLedger(c.storageDir);
+    try { expect(ledger.summary().requests).toBe(2); expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000144); }
+    finally { ledger.close(); }
+  });
+  it.each([
+    ['missing criterion', (draft: ReturnType<typeof wirePlan>) => { draft.items[0]!.acceptanceChecks = []; }],
+    ['unknown requirement', (draft: ReturnType<typeof wirePlan>) => { draft.items[0]!.requirementIds = ['unknown']; }],
+    ['unknown command', (draft: ReturnType<typeof wirePlan>) => { draft.items[0]!.acceptanceChecks[0]!.commandId = 'unknown'; }],
+    ['line range', (draft: ReturnType<typeof wirePlan>) => { draft.items[0]!.codeRefs[0]!.endLine = 3; }],
+    ['write scope', (draft: ReturnType<typeof wirePlan>) => { draft.items[0]!.affectedPaths = ['private/app.ts']; }],
+  ])('allows one complete correction for %s', async (_name, mutate) => {
+    const c = config(); const invalid = wirePlan(); mutate(invalid);
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValueOnce(response(invalid)).mockResolvedValueOnce(response(wirePlan()));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).resolves.toMatchObject({ title: '기능 활성화' });
+    expect(parse).toHaveBeenCalledTimes(2);
+  });
+  it('stops after a second invalid plan and applies every final invariant', async () => {
+    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(missingCriterion()));
+    const input = { analysis: analysis(), context, config: c, requirementIds: ['R1'] };
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow('Plan must map every selected acceptance criterion exactly once');
+    expect(parse).toHaveBeenCalledTimes(2);
+    const outsideScope = wirePlan(); outsideScope.items[0]!.affectedPaths = ['private/app.ts'];
+    parse.mockReset().mockResolvedValueOnce(response(missingCriterion())).mockResolvedValueOnce(response(outsideScope));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow('write scope');
+    expect(parse).toHaveBeenCalledTimes(2);
+  });
+  it('does not send a correction if the second reservation exceeds the same durable budget', async () => {
+    const c = config(); c.development!.budgetUsd = 0.5;
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: missingCriterion(), output: [] });
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('API budget would be exceeded');
+    expect(parse).toHaveBeenCalledTimes(1);
+    const ledger = new BudgetLedger(c.storageDir, 0.5); try { expect(ledger.summary().requests).toBe(1); } finally { ledger.close(); }
+  });
+  it('never retries credentials, malformed correction output or a correction provider failure', async () => {
+    const c = config(); const input = { analysis: analysis(), context, config: c, requirementIds: ['R1'] };
+    const credential = missingCriterion(); credential.summary = 'sk-' + 'x'.repeat(24);
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(credential));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow('credential');
+    expect(parse).toHaveBeenCalledTimes(1);
+    parse.mockReset().mockResolvedValueOnce(response(missingCriterion())).mockResolvedValueOnce(response({ ...wirePlan(), approved: true }));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow();
+    expect(parse).toHaveBeenCalledTimes(2);
+    parse.mockReset().mockResolvedValueOnce(response(missingCriterion())).mockRejectedValueOnce(new Error('500 on correction'));
+    const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
+    await expect(planner.plan(input)).rejects.toThrow('500 on correction');
+    expect(parse).toHaveBeenCalledTimes(2);
+    expect(planner.usage).toMatchObject({ inputTokens: 100, outputTokens: 20, attempts: [expect.objectContaining({ inputTokens: 100 }), null] });
+  });
+  it('uses frozen analysis and source code for correction and final validation', async () => {
+    const c = config(); const input = { analysis: analysis(), context: structuredClone(context), config: c, requirementIds: ['R1'] };
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockImplementationOnce(async () => {
+      input.context.files[0]!.content = 'changed source'; input.analysis.requirements[0]!.acceptanceCriteria = [];
+      return response(missingCriterion());
+    }).mockResolvedValueOnce(response(wirePlan()));
+    const result = await new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input);
+    expect(result.items[0]!.codeRefs[0]!.quote).toBe('export const enabled = false;');
+    expect(JSON.parse(parse.mock.calls[1]![0].input).expectedRequirementCriteria).toEqual([{ requirementId: 'R1', criterionIds: ['A1'] }]);
+    expect(parse).toHaveBeenCalledTimes(2);
   });
 });
