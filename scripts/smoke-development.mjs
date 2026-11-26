@@ -11,7 +11,7 @@ import { FileImplementer, OpenAIImplementer, BudgetLedger } from '../dist/genera
 import { DockerRunner } from '../dist/runner.js';
 
 // Entirely synthetic local repository and discussion. No Slack messages or PRs.
-// --live permits two bounded model requests; default replays fixed JSON for $0.
+// --live permits one request and at most one correction per stage, within $0.90.
 const live = process.argv.includes('--live');
 if (process.argv.slice(2).some(arg => arg !== '--live')) throw new Error('Only --live is supported.');
 const parent = resolve('.slack-dev'); mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -68,6 +68,6 @@ const resumed = JSON.parse(execFileSync(process.execPath, [resolve('dist/cli.js'
   env: { ...process.env, OPENAI_API_KEY: '', SLACK_TOKEN: '', DOTENV_CONFIG_QUIET: 'true' } }));
 assert.equal(resumed.commitSha, completed.commitSha); assert.equal(resumed.status, 'review_ready');
 const ledger = new BudgetLedger(config.storageDir, 0.90); const budget = ledger.summary(); ledger.close();
-assert(budget.requests <= (live ? 2 : 0)); assert(budget.reservedOrSpentUsd <= 0.90);
+assert(budget.requests <= (live ? 4 : 0)); assert(budget.reservedOrSpentUsd <= 0.90);
 writeArtifact(join(directory, 'result.json'), { passed: true, live, testedAt: new Date().toISOString(), ...completed, independent, cliResumeVerified: true, budget });
 console.log(JSON.stringify({ passed: true, live, ...completed, independentAcceptance: 'passed', cliResumeVerified: true, budget, resultPath: join(directory, 'result.json') }, null, 2));

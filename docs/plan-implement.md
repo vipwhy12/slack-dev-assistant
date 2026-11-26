@@ -47,7 +47,7 @@ cp examples/development-project.json development-project.json
 | `development.maxFiles` | 읽을 파일 수 제한. 기본 30개 |
 | `development.maxChangedFiles` | 한 번에 바꿀 파일 수 제한. 기본 12개 |
 | `development.maxChangeBytes` | 파일 변경 결과의 크기 제한. 기본 98,304바이트 |
-| `development.budgetUsd` | 계획·구현 모델 호출의 누적 예산 한도. 기본·최대 $10 |
+| `development.budgetUsd` | 같은 저장 경로의 지식 저장·분석·계획·구현 모델 호출이 공유하는 누적 예산 한도. 기본·최대 $10 |
 | `github.repository` | PR을 게시할 `owner/repository` |
 | `github.baseBranch` | PR 대상 브랜치 |
 | `github.remote` | 푸시할 Git remote 이름 |
@@ -194,17 +194,17 @@ node dist/cli.js implement '<planId>' \
 
 ## 비용과 호출 제한
 
-유료 `plan`·`implement`는 현재 `gpt-4.1-mini`를 지원합니다. 호출 전 모델의 전체 입력 한도와 출력 상한을 기준으로 호출당 약 $0.4322를 보수적으로 예약하고 `budget.sqlite`에 저장합니다. 이는 실제 호출 비용이 아닙니다. 누적 예산은 기본·최대 $10이며 `development.budgetUsd`로 더 작은 한도를 지정할 수 있습니다. 예산을 예약할 수 없으면 호출 전에 중단합니다. 자동 API 재시도는 하지 않습니다.
+CLI·Slack의 유료 `save`·`analyze`·`plan`·`implement`는 현재 `gpt-4.1-mini`를 지원하며 같은 예산 장부를 사용합니다. 호출 전 모델의 전체 입력 한도와 출력 상한을 기준으로 호출당 약 $0.4322를 보수적으로 예약하고 `budget.sqlite`에 저장합니다. 이는 실제 호출 비용이 아닙니다. 누적 예산은 기본·최대 $10이며 `development.budgetUsd`로 더 작은 한도를 지정할 수 있습니다. 예산을 예약할 수 없으면 호출 전에 중단합니다. 네트워크·API·스키마 오류는 자동 재시도하지 않습니다. 일부 모델 출력의 로컬 검증 오류는 분석·계획·구현 단계별 한 번만 교정하며, 추가 호출도 같은 예산의 예약 검사를 거칩니다.
 
 ```sh
 node dist/cli.js budget --config development-project.json
 ```
 
-`reservedOrSpentUsd`는 확정된 추정액과 사용량을 모르는 예약액의 합계이며 `limitUsd`는 설정 한도, `requests`는 예약한 호출 수입니다. 같은 `storageDir`를 쓰는 계획·구현 호출이 이 누적액을 공유합니다.
+`reservedOrSpentUsd`는 확정된 추정액과 사용량을 모르는 예약액의 합계이며 `limitUsd`는 설정 한도, `requests`는 예약한 호출 수입니다. 같은 `storageDir`를 쓰는 지식 저장·분석·계획·구현 호출과 교정 호출이 이 누적액을 공유합니다.
 
 모델이 반환한 토큰 사용량으로 추정 비용을 기록합니다. 실패 응답에 사용량이 없으면 실제 비용을 0으로 단정하지 않고 예약액을 보존합니다. 결과의 추정 비용은 OpenAI 청구서와 동일한 값이라는 보장이 없습니다.
 
-이 예산 제한은 **계획·구현 호출에 적용**됩니다. 기존 `analyze` 호출, 다른 애플리케이션의 API 사용량이나 OpenAI 계정 전체의 청구액을 제한하지 않습니다. 예산 기록을 삭제하거나 다른 저장 경로를 사용하면 기존 누적 이력을 이어받지 못하므로, 한도를 유지하려면 같은 저장 경로를 사용하세요.
+이 예산 제한은 **이 도구의 CLI·Slack 유료 모델 호출에 적용**됩니다. 다른 애플리케이션의 API 사용량이나 OpenAI 계정 전체의 청구액을 제한하지 않습니다. 예산 기록을 삭제하거나 다른 저장 경로를 사용하면 기존 누적 이력을 이어받지 못하므로, 한도를 유지하려면 같은 저장 경로를 사용하세요.
 
 `--plan-file`과 `--changes-file`은 각각 해당 모델 호출을 대체합니다. Docker 검증이나 GitHub 게시를 생략하는 옵션은 아닙니다.
 
