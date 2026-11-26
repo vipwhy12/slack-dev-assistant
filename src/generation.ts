@@ -68,7 +68,6 @@ function materializeSurgicalChanges(input: unknown, plan: PlanDraft, context: Re
     } else if (original === undefined) throw new Error('Cannot edit or delete a file absent from repository context');
     if (file.kind === 'edit') for (const replacement of file.replacements) {
       if (replacement.old.includes('\0') || replacement.new.includes('\0')) throw new Error('Generated edits must be plain text');
-      if (replacement.old === replacement.new) throw new Error('Generated replacement has no change');
     }
   }
   const files: ChangeSet['files'] = [];
@@ -76,7 +75,10 @@ function materializeSurgicalChanges(input: unknown, plan: PlanDraft, context: Re
     if (file.kind === 'create') { files.push({ path: file.path, content: file.content }); continue; }
     if (file.kind === 'delete') { files.push({ path: file.path, content: null }); continue; }
     const original = originals.get(file.path)!;
-    const replacements = file.replacements.map(replacement => {
+    // Identical entries have no effect, but cannot stand in for a real change to a planned file.
+    const edits = file.replacements.filter(replacement => replacement.old !== replacement.new);
+    if (!edits.length) throw new RepairableChangesError(`Generated file has no real replacements: ${file.path}`);
+    const replacements = edits.map(replacement => {
       const start = original.indexOf(replacement.old);
       if (start < 0) throw new RepairableChangesError(`Replacement anchor does not exactly match the supplied ${baseChanges ? 'current' : 'original'} file`);
       // Search from start + 1 so overlapping occurrences (e.g. aaa within aaaa) are ambiguous too.

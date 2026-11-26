@@ -164,6 +164,25 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     const {result} = await generate(output,input(config(),repository));
     expect(result.files[0]!.content).toBe('prefix\nconst first = 10;\nconst second = 20;\nsuffix\n');
   });
+  it('discards identical entries beside real edits without changing the resulting file or making another request', async () => {
+    const output = patch(); output.files[0]!.replacements.push({ old: 'enabled', new: 'enabled' });
+    const { result, parse } = await generate(output);
+    expect(result).toEqual(changes()); expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it('still checks real anchors and rejects unsafe no-op payloads and out-of-scope files', async () => {
+    const mismatched = patch(); mismatched.files[0]!.replacements[0]!.old = 'missing original';
+    mismatched.files[0]!.replacements.push({ old: 'enabled', new: 'enabled' });
+    const badAnchor = provider({ output_parsed: mismatched }); const options = input();
+    await expect(new OpenAIImplementer(options.config, { client: badAnchor.client }).implement(options)).rejects.toThrow('does not exactly match');
+    expect(badAnchor.parse).toHaveBeenCalledTimes(2);
+    const binary = patch(); binary.files[0]!.replacements.push({ old: 'x\0', new: 'x\0' });
+    const escaped = patch(); escaped.files.push({ path: 'src/unapproved.ts', kind: 'edit', replacements: [{ old: 'same', new: 'same' }] });
+    for (const invalid of [binary, escaped]) {
+      const fake = provider({ output_parsed: invalid });
+      await expect(new OpenAIImplementer(options.config, { client: fake.client }).implement(options)).rejects.toThrow();
+      expect(fake.parse).toHaveBeenCalledTimes(1);
+    }
+  });
   it('preserves CRLF, Unicode and literal replacement characters without regex/substitution semantics', async () => {
     const repository = {...context,files:[{path:'src/app.ts',content:'// 원문\r\nconst label = "전";\r\n// 끝\r\n'}]};
     const output = {summary:'레이블 변경',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'const label = "전";',new:'const label = "$& $` $1 후";'}]}]};
@@ -196,7 +215,7 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
   ])('rejects %s, permitting only one bounded correction for anchor errors', async (name, output) => {
     const options = input(); const {client,parse} = provider({output_parsed:output});
     await expect(new OpenAIImplementer(options.config,{client}).implement(options)).rejects.toThrow();
-    expect(parse).toHaveBeenCalledTimes(['unmatched old','overlap','new output anchor'].includes(name) ? 2 : 1);
+    expect(parse).toHaveBeenCalledTimes(['unmatched old','same old and new','overlap','new output anchor'].includes(name) ? 2 : 1);
   });
   it.each(['same same','aaaa'])('rejects multiple or overlapping occurrences of an anchor in %s', async original => {
     const repository = {...context,files:[{path:'src/app.ts',content:original}]};
@@ -236,6 +255,14 @@ describe('complete planned file coverage and one bounded implementation correcti
     expect(() => validateChanges(changes(),planned,context,config())).toThrow('missing planned files: tests/new.ts');
     const existingTest = {...context,files:[...context.files,{path:'tests/new.ts',content:testContent}]};
     expect(() => validateChanges({...changes(),files:[...changes().files,{path:'tests/new.ts',content:testContent}]},planned,existingTest,config())).toThrow('no change');
+  });
+  it('never counts a no-op-only planned test file as implemented and allows only the existing correction', async () => {
+    const options = { ...input(), context: { ...context, files: [...context.files, { path: 'tests/new.ts', content: testContent }] } };
+    const output = { ...sourceOnly, files: [...sourceOnly.files,
+      { path: 'tests/new.ts', kind: 'edit', replacements: [{ old: testContent, new: testContent }] }] };
+    const fake = provider({ output_parsed: output });
+    await expect(new OpenAIImplementer(options.config, { client: fake.client }).implement(options)).rejects.toThrow('no real replacements: tests/new.ts');
+    expect(fake.parse).toHaveBeenCalledTimes(2);
   });
   it('repairs a missing planned test once, returning complete validated file content and aggregating both reservations', async () => {
     const options = input(); const fake = provider(); fake.parse.mockReset().mockResolvedValueOnce(response(sourceOnly)).mockResolvedValueOnce(response(complete));
@@ -314,6 +341,15 @@ describe('bounded implementation repair after failed verification', () => {
   }
   const response = (output: unknown): GenerationResponse => ({ status: 'completed', output: [], output_parsed: output,
     usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } });
+  it('ignores identical repair entries beside a real fix but rejects no-op-only repair attempts', async () => {
+    const options = input(); const output = patch(); output.files[0]!.replacements.push({ old: 'enabled = true', new: 'enabled = true' });
+    const fake = provider(response(output));
+    await expect(new OpenAIImplementer(options.config, { client: fake.client }).repair(options)).resolves.toEqual(changes());
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+    const noop = provider(response({ summary: 'No fix', files: [{ path: 'src/app.ts', kind: 'edit', replacements: [{ old: failedContent, new: failedContent }] }] }));
+    await expect(new OpenAIImplementer(options.config, { client: noop.client }).repair(options)).rejects.toThrow('no real replacements');
+    expect(noop.parse).toHaveBeenCalledTimes(2);
+  });
   it('repairs the current failed files and sends no second full-file baseline with the diagnostic logs', async () => {
     const options = input(); const before = structuredClone(options); const fake = provider(response(patch()));
     const implementer = new OpenAIImplementer(options.config, { client: fake.client });
