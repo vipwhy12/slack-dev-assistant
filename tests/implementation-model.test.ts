@@ -103,7 +103,7 @@ describe('implementation-only model routing', () => {
     expect(fake.parse.mock.calls.map(([request]) => request.text.format.name)).toEqual([
       'file_edits', 'file_edits_repair', 'file_edits_verification_repair', 'file_edits_verification_repair_anchor',
     ]);
-    expect(fake.parse.mock.calls.every(([request]) => request.store === false && request.max_output_tokens === 8192)).toBe(true);
+    expect(fake.parse.mock.calls.every(([request]) => request.store === false && request.max_output_tokens === 16384)).toBe(true);
     expect(implementer.usage?.estimatedCostUsd).toBeCloseTo(0.00072, 12);
     const ledger = new BudgetLedger(c.storageDir, 6.7);
     try { expect(ledger.summary()).toEqual({ reservedOrSpentUsd: 0.00144, limitUsd: 6.7, requests: 4 }); }
@@ -123,7 +123,7 @@ describe('implementation-only model routing', () => {
 describe('shared model-priced request ledger', () => {
   it('uses conservative model-specific context and output reservations', () => {
     expect(modelMaxRequestCostUsd('gpt-4.1-mini')).toBeCloseTo(0.4321376, 12);
-    expect(modelMaxRequestCostUsd('gpt-4.1')).toBeCloseTo(2.160688, 12);
+    expect(modelMaxRequestCostUsd('gpt-4.1')).toBeCloseTo(2.226224, 12);
   });
 
   it('settles cached usage with each persisted reservation model after reopening the same database', () => {
@@ -131,7 +131,7 @@ describe('shared model-priced request ledger', () => {
     // Phase names deliberately differ from model roles: the stored model determines pricing.
     const mini = ledger.reserve('file_edits');
     const full = ledger.reserve('plan', 'gpt-4.1');
-    expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(2.5928256, 12);
+    expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(2.6583616, 12);
     ledger.close();
     const reopened = new BudgetLedger(c.storageDir, 6.7);
     const usage = { input_tokens: 200, output_tokens: 50, total_tokens: 250, input_tokens_details: { cached_tokens: 50 } };
@@ -145,14 +145,14 @@ describe('shared model-priced request ledger', () => {
   it('counts both models against one durable $6.70 cap and blocks either provider before sending a request', async () => {
     const c = config('gpt-4.1'); const ledger = new BudgetLedger(c.storageDir, 6.7);
     for (let i = 0; i < 3; i++) ledger.reserve('file_edits', 'gpt-4.1');
-    expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(6.482064, 12);
+    expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(6.678672, 12);
     ledger.close();
     const fake = provider(response(patch()), response({ value: 'ok' }));
     await expect(new OpenAIImplementer(c, { client: fake.client }).implement(input(c))).rejects.toThrow(/budget/);
     await expect(new StructuredGenerator(c, { client: fake.client }).generate(z.object({ value: z.string() }), 'plan', 'Fixture instructions', {})).rejects.toThrow(/budget/);
     expect(fake.parse).not.toHaveBeenCalled();
     const reopened = new BudgetLedger(c.storageDir, 6.7);
-    try { expect(reopened.summary()).toEqual({ reservedOrSpentUsd: 6.482064, limitUsd: 6.7, requests: 3 }); }
+    try { expect(reopened.summary()).toEqual({ reservedOrSpentUsd: 6.678672, limitUsd: 6.7, requests: 3 }); }
     finally { reopened.close(); }
   });
 
@@ -161,7 +161,7 @@ describe('shared model-priced request ledger', () => {
     await expect(new OpenAIImplementer(c, { client: fake.client }).implement(input(c))).rejects.toThrow('connection interruption');
     expect(fake.parse).toHaveBeenCalledTimes(1);
     const reopened = new BudgetLedger(c.storageDir, 6.7);
-    try { expect(reopened.summary()).toEqual({ reservedOrSpentUsd: 2.160688, limitUsd: 6.7, requests: 1 }); }
+    try { expect(reopened.summary()).toEqual({ reservedOrSpentUsd: 2.226224, limitUsd: 6.7, requests: 1 }); }
     finally { reopened.close(); }
   });
 
@@ -171,7 +171,7 @@ describe('shared model-priced request ledger', () => {
     await expect(new OpenAIImplementer(c, { client: fake.client }).implement(input(c))).rejects.toThrow(/budget/);
     expect(fake.parse).toHaveBeenCalledTimes(1);
     const ledger = new BudgetLedger(c.storageDir, 3);
-    try { expect(ledger.summary()).toEqual({ reservedOrSpentUsd: 2.160688, limitUsd: 3, requests: 1 }); }
+    try { expect(ledger.summary()).toEqual({ reservedOrSpentUsd: 2.226224, limitUsd: 3, requests: 1 }); }
     finally { ledger.close(); }
   });
 });

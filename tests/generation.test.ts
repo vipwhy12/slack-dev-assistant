@@ -9,7 +9,7 @@ import { configSchema, type ProjectConfig } from '../src/config.js';
 import type { RepositoryContext } from '../src/repository.js';
 import type { PlanDraft } from '../src/planning.js';
 import type { VerificationResult } from '../src/runner.js';
-import { BudgetLedger, containsCredential, FileImplementer, MAX_REQUEST_COST_USD, OpenAIImplementer, StructuredGenerator, validateChanges,
+import { BudgetLedger, containsCredential, FileImplementer, MAX_REQUEST_COST_USD, MODEL_CONTEXT_TOKENS, modelMaxOutputTokens, modelMaxRequestCostUsd, OpenAIImplementer, StructuredGenerator, validateChanges,
   type ChangeSet, type GenerationClient, type GenerationResponse, type ImplementationRepairInput } from '../src/generation.js';
 const directories: string[] = [];
 function config(): ProjectConfig {
@@ -65,6 +65,21 @@ describe('whole-file change validation', () => {
 });
 
 describe('durable request budgets', () => {
+  it.each([
+    ['gpt-4.1-mini', 8192, 0.4321376], ['gpt-4.1', 16384, 2.226224],
+  ] as const)('uses the %s output limit in both reservation and usage validation', (model, maxOutput, worstCost) => {
+    const c = config(); const ledger = new BudgetLedger(c.storageDir, 6.7);
+    try {
+      expect(modelMaxOutputTokens(model)).toBe(maxOutput);
+      expect(modelMaxRequestCostUsd(model)).toBeCloseTo(worstCost, 12);
+      const id = ledger.reserve('file_edits', model);
+      expect(ledger.summary()).toEqual({ reservedOrSpentUsd: worstCost, limitUsd: 6.7, requests: 1 });
+      expect(ledger.settle(id, { input_tokens: 0, output_tokens: maxOutput + 1, total_tokens: maxOutput + 1 })).toBeUndefined();
+      expect(ledger.summary().reservedOrSpentUsd).toBe(worstCost);
+      expect(ledger.settle(id, { input_tokens: MODEL_CONTEXT_TOKENS, output_tokens: maxOutput, total_tokens: MODEL_CONTEXT_TOKENS + maxOutput }))
+        .toMatchObject({ outputTokens: maxOutput, estimatedCostUsd: worstCost });
+    } finally { ledger.close(); }
+  });
   it('reserves before requests, survives restart and rejects exceeding cumulative allowance', () => {
     const c = config(); const ledger = new BudgetLedger(c.storageDir, 0.5);
     ledger.reserve('plan'); expect(ledger.summary()).toEqual({ reservedOrSpentUsd: MAX_REQUEST_COST_USD, limitUsd: 0.5, requests: 1 }); ledger.close();
@@ -92,6 +107,16 @@ describe('durable request budgets', () => {
 });
 
 describe('paid transport boundary using mocked requests only', () => {
+  it.each(['gpt-4.1-mini', 'gpt-4.1'] as const)('sends the %s implementation limit and accepts usage up to that limit', async model => {
+    const c = config(); c.development!.implementationModel = model;
+    const maxOutput = model === 'gpt-4.1' ? 16384 : 8192;
+    const { client, parse } = provider({ usage: { input_tokens: 100, output_tokens: maxOutput, total_tokens: 100 + maxOutput } });
+    const generator = new StructuredGenerator(c, { client }, 'implementation');
+    await expect(generator.generate(schema, 'file_edits', 'instructions', {})).resolves.toEqual({ value: 'ok' });
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse.mock.calls[0]![0]).toMatchObject({ model, max_output_tokens: maxOutput });
+    expect(generator.usage).toMatchObject({ inputTokens: 100, outputTokens: maxOutput, totalTokens: 100 + maxOutput });
+  });
   it('calls once with strict output, bounded tokens and no remote storage; captures usage', async () => {
     const c = config(); const { client, parse } = provider({ usage: { input_tokens: 100, output_tokens: 200, total_tokens: 300 } });
     const generator = new StructuredGenerator(c, { client });

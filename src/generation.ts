@@ -170,9 +170,13 @@ function modelPricing(model: string) {
   if (!Object.hasOwn(MODEL_PRICING, model)) throw new Error('Paid workflows require a verified model: gpt-4.1-mini or implementation-only gpt-4.1');
   return MODEL_PRICING[model as keyof typeof MODEL_PRICING];
 }
+export function modelMaxOutputTokens(model: string): number {
+  modelPricing(model);
+  return model === 'gpt-4.1' ? 16_384 : MAX_OUTPUT_TOKENS;
+}
 export function modelMaxRequestCostUsd(model: string): number {
   const rate = modelPricing(model);
-  return (MODEL_CONTEXT_TOKENS * rate.input + MAX_OUTPUT_TOKENS * rate.output) / 1e9;
+  return (MODEL_CONTEXT_TOKENS * rate.input + modelMaxOutputTokens(model) * rate.output) / 1e9;
 }
 export const MAX_REQUEST_COST_USD = modelMaxRequestCostUsd(VERIFIED_MODEL);
 export function implementationModel(config: ProjectConfig): string {
@@ -219,7 +223,7 @@ export class BudgetLedger {
     const rate = modelPricing(reservation.model);
     const cached = usage.input_tokens_details?.cached_tokens ?? 0;
     if (![usage.input_tokens, usage.output_tokens, usage.total_tokens, cached].every(value => Number.isSafeInteger(value) && value >= 0)
-      || cached > usage.input_tokens || usage.input_tokens > MODEL_CONTEXT_TOKENS || usage.output_tokens > MAX_OUTPUT_TOKENS
+      || cached > usage.input_tokens || usage.input_tokens > MODEL_CONTEXT_TOKENS || usage.output_tokens > modelMaxOutputTokens(reservation.model)
       || usage.total_tokens !== usage.input_tokens + usage.output_tokens) return undefined;
     const cost = (usage.input_tokens - cached) * rate.input + cached * rate.cachedInput + usage.output_tokens * rate.output;
     // Unknown or implausible usage retains the entire conservative reservation.
@@ -290,7 +294,7 @@ export class StructuredGenerator {
     try {
       const id = ledger.reserve(phase, this.model);
       const response = await this.client.responses.parse({ model: this.model, instructions, input, store: false,
-        max_output_tokens: MAX_OUTPUT_TOKENS, text: { format: zodTextFormat(schema, phase) } });
+        max_output_tokens: modelMaxOutputTokens(this.model), text: { format: zodTextFormat(schema, phase) } });
       if (response.usage) this.usage = ledger.settle(id, response.usage, response._request_id ?? undefined);
       const refused = Array.isArray(response.output) && response.output.some(item => Array.isArray(item.content) && item.content.some((content: unknown) =>
         typeof content === 'object' && content !== null && 'type' in content && content.type === 'refusal'));
