@@ -15,7 +15,8 @@ function config(): ProjectConfig {
     development: { readPaths: ['src'], writePaths: ['src', 'tests'], commands: [{ id: 'test', program: 'npm', args: ['test'] }], dockerImage: 'node:24' } });
 }
 const context: RepositoryContext = { repoPath: '/unused', commitSha: 'abc123', files: [{ path: 'src/app.ts', content: 'export const enabled = false;\n' }], omittedPaths: [] };
-const plan: PlanDraft = { summary: 'enable', items: [{ id: 'P1', requirementIds: ['R1'], currentBehavior: 'disabled', codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], proposedChanges: 'enable', affectedPaths: ['src/app.ts', 'tests/new.ts'], dependencies: [], acceptanceChecks: [], blockers: [] }], excludedRequirements: [] };
+const plan: PlanDraft = { summary: 'enable', items: [{ id: 'P1', requirementIds: ['R1'], currentBehavior: 'disabled', codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], proposedChanges: 'enable', affectedPaths: ['src/app.ts'], dependencies: [], acceptanceChecks: [], blockers: [] }], excludedRequirements: [] };
+function plannedPaths(...paths: string[]): PlanDraft { return {...plan,items:[{...plan.items[0]!,affectedPaths:paths}]}; }
 function changes(): ChangeSet { return { summary: 'Enable', files: [{ path: 'src/app.ts', content: 'export const enabled = true;\n' }] }; }
 function provider(overrides: Partial<GenerationResponse> = {}) {
   const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output: [], output_parsed: { value: 'ok' }, ...overrides });
@@ -27,7 +28,7 @@ afterEach(() => { for (const directory of directories.splice(0)) rmSync(director
 describe('whole-file change validation', () => {
   it('accepts actual edits, additions and deletion of a context file', () => {
     const c = config(); expect(validateChanges(changes(), plan, context, c)).toEqual(changes());
-    expect(validateChanges({ summary: 'new', files: [{ path: 'tests/new.ts', content: 'export {}' }] }, plan, context, c).files).toHaveLength(1);
+    expect(validateChanges({ summary: 'new', files: [{ path: 'tests/new.ts', content: 'export {}' }] }, plannedPaths('tests/new.ts'), context, c).files).toHaveLength(1);
     expect(validateChanges({ summary: 'delete', files: [{ path: 'src/app.ts', content: null }] }, plan, context, c).files[0]!.content).toBeNull();
   });
   it.each([
@@ -152,7 +153,7 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     expect(parse).toHaveBeenCalledTimes(1);
     expect(parse.mock.calls[0]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'file_edits',strict:true}}});
     expect(parse.mock.calls[0]![0].instructions).toContain('same original file');
-    expect(parse.mock.calls[0]![0].instructions).toContain('without an automatic retry');
+    expect(parse.mock.calls[0]![0].instructions).toContain('at most one bounded correction');
   });
   it('supports independent original anchors in any order without editing unrelated content', async () => {
     const repository = {...context,files:[{path:'src/app.ts',content:'prefix\nconst first = 1;\nconst second = 2;\nsuffix\n'}]};
@@ -168,7 +169,7 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     expect((await generate(output,input(config(),repository))).result.files[0]!.content).toBe('// 원문\r\nconst label = "$& $` $1 후";\r\n// 끝\r\n');
   });
   it('accepts explicit create and delete and permits deleting text with an empty new string', async () => {
-    const {result} = await generate({summary:'파일 변경',files:[{path:'src/app.ts',kind:'delete'},{path:'tests/new.ts',kind:'create',content:'export {};\n'}]});
+    const {result} = await generate({summary:'파일 변경',files:[{path:'src/app.ts',kind:'delete'},{path:'tests/new.ts',kind:'create',content:'export {};\n'}]}, {...input(),plan:plannedPaths('src/app.ts','tests/new.ts')});
     expect(result.files).toEqual([{path:'src/app.ts',content:null},{path:'tests/new.ts',content:'export {};\n'}]);
     expect((await generate({summary:'주석 삭제',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'export ',new:''}]}]})).result.files[0]!.content).toBe('const enabled = false;\n');
   });
@@ -191,10 +192,10 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     ['credential summary', {summary:`xoxb-${'x'.repeat(30)}`,files:patch().files}],
     ['unplanned path', {summary:'x',files:[{path:'src/not-planned.ts',kind:'create',content:'export {};'}]}],
     ['traversal path', {summary:'x',files:[{path:'src/../outside',kind:'create',content:'export {};'}]}],
-  ])('rejects %s after exactly one provider response without a retry', async (_name, output) => {
+  ])('rejects %s, permitting only one bounded correction for anchor errors', async (name, output) => {
     const options = input(); const {client,parse} = provider({output_parsed:output});
     await expect(new OpenAIImplementer(options.config,{client}).implement(options)).rejects.toThrow();
-    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse).toHaveBeenCalledTimes(['unmatched old','overlap','new output anchor'].includes(name) ? 2 : 1);
   });
   it.each(['same same','aaaa'])('rejects multiple or overlapping occurrences of an anchor in %s', async original => {
     const repository = {...context,files:[{path:'src/app.ts',content:original}]};
@@ -220,5 +221,82 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     expect(Buffer.byteLength(result.files[0]!.content!)).toBeGreaterThan(30_000);
     expect(result.files[0]!.content).toBe(original.replace('padding: 8px','padding: 12px'));
     expect(parse.mock.calls[0]![0].max_output_tokens).toBe(8192);
+  });
+});
+
+describe('complete planned file coverage and one bounded implementation correction', () => {
+  const planned = plannedPaths('src/app.ts','tests/new.ts');
+  const sourceOnly = {summary:'기능과 테스트를 추가합니다.',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'}]}]};
+  const testContent = "import { enabled } from '../src/app';\nimport { expect, it } from 'vitest';\nit('enables the approved behavior', () => expect(enabled).toBe(true));\n";
+  const complete = {...sourceOnly,files:[...sourceOnly.files,{path:'tests/new.ts',kind:'create',content:testContent}]};
+  const input = (c = config()) => ({analysis:{summary:'활성화와 회귀 테스트',requirements:[],questions:[]},plan:planned,context,config:c});
+  const response = (output: unknown) => ({status:'completed',output:[],output_parsed:output,usage:{input_tokens:100,output_tokens:20,total_tokens:120}});
+  it('rejects a CSS/source-only change even when the summary claims the planned tests were added', () => {
+    expect(() => validateChanges(changes(),planned,context,config())).toThrow('missing planned files: tests/new.ts');
+    const existingTest = {...context,files:[...context.files,{path:'tests/new.ts',content:testContent}]};
+    expect(() => validateChanges({...changes(),files:[...changes().files,{path:'tests/new.ts',content:testContent}]},planned,existingTest,config())).toThrow('no change');
+  });
+  it('repairs a missing planned test once, returning complete validated file content and aggregating both reservations', async () => {
+    const options = input(); const fake = provider(); fake.parse.mockReset().mockResolvedValueOnce(response(sourceOnly)).mockResolvedValueOnce(response(complete));
+    const implementer = new OpenAIImplementer(options.config,{client:fake.client});
+    const result = await implementer.implement(options);
+    expect(result.files.map(file=>file.path)).toEqual(['src/app.ts','tests/new.ts']);
+    expect(result.files[1]!.content).toBe(testContent);
+    expect(fake.parse).toHaveBeenCalledTimes(2); expect(implementer.promptVersion).toBe('implementation-v3');
+    const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
+    expect(first.expectedChangedPaths).toEqual(['src/app.ts','tests/new.ts']);
+    const {correction,...sameSource} = second; expect(sameSource).toEqual(first);
+    expect(correction.validationError).toContain('missing planned files: tests/new.ts');
+    expect(correction.invalidEdits).toEqual(sourceOnly);
+    expect(fake.parse.mock.calls[1]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'file_edits_repair'}}});
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('meaningful tests required by the approved plan');
+    expect(implementer.usage).toMatchObject({inputTokens:200,outputTokens:40,totalTokens:240});
+    expect(implementer.usage?.attempts).toHaveLength(2);
+    expect(implementer.usage?.attempts?.[0]?.reservationId).not.toBe(implementer.usage?.attempts?.[1]?.reservationId);
+    const ledger = new BudgetLedger(options.config.storageDir); try {expect(ledger.summary()).toMatchObject({requests:2});expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000144);} finally {ledger.close();}
+  });
+  it.each(['missing','mismatch','ambiguous','overlap'])('repairs only one %s error using the original file', async kind => {
+    const options = input();
+    let broken: unknown = sourceOnly;
+    if(kind==='mismatch') broken = {...complete,files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'wrong original',new:'fixed'}]},complete.files[1]!]};
+    if(kind==='ambiguous') {
+      options.context={...context,files:[{path:'src/app.ts',content:'export const enabled = false;\n// false\n'}]};
+      broken={...complete,files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'false',new:'true'}]},complete.files[1]!]};
+    }
+    if(kind==='overlap') broken={...complete,files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'},{old:'false;',new:'true;'}]},complete.files[1]!]};
+    const fake=provider();fake.parse.mockReset().mockResolvedValueOnce(response(broken)).mockResolvedValueOnce(response(complete));
+    await expect(new OpenAIImplementer(options.config,{client:fake.client}).implement(options)).resolves.toMatchObject({files:[{path:'src/app.ts'},{path:'tests/new.ts'}]});
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+  });
+  it('stops after a second invalid output and rejects a repair that expands scope', async () => {
+    const options=input();const repeat=provider({output_parsed:sourceOnly});
+    await expect(new OpenAIImplementer(options.config,{client:repeat.client}).implement(options)).rejects.toThrow('missing planned files');
+    expect(repeat.parse).toHaveBeenCalledTimes(2);
+    const escaped=provider();escaped.parse.mockReset().mockResolvedValueOnce(response(sourceOnly)).mockResolvedValueOnce(response({...complete,files:[...complete.files,{path:'src/unapproved.ts',kind:'create',content:'export {};'}]}));
+    await expect(new OpenAIImplementer(options.config,{client:escaped.client}).implement(options)).rejects.toThrow('write scope');
+    expect(escaped.parse).toHaveBeenCalledTimes(2);
+  });
+  it('does not call a repair when another reservation cannot fit in the budget', async () => {
+    const options=input();options.config.development!.budgetUsd=0.5;
+    const fake=provider({output_parsed:sourceOnly}); // Unknown usage keeps the first full reservation.
+    await expect(new OpenAIImplementer(options.config,{client:fake.client}).implement(options)).rejects.toThrow('API budget would be exceeded');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+    const ledger=new BudgetLedger(options.config.storageDir,0.5);try {expect(ledger.summary().requests).toBe(1);} finally {ledger.close();}
+  });
+  it('never retries provider/schema/credential/scope errors, including errors beside a repairable anchor', async () => {
+    const options=input();const failed=provider();failed.parse.mockRejectedValue(new Error('500 provider'));
+    await expect(new OpenAIImplementer(options.config,{client:failed.client}).implement(options)).rejects.toThrow('500 provider');expect(failed.parse).toHaveBeenCalledTimes(1);
+    const invalids=[{...complete,approved:true}, {...complete,summary:`sk-${'x'.repeat(30)}`},
+      {...complete,files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'wrong',new:'x'}]},{path:'src/outside-plan.ts',kind:'create',content:'export {};'}]}];
+    for(const output of invalids){const fake=provider({output_parsed:output});await expect(new OpenAIImplementer(options.config,{client:fake.client}).implement(options)).rejects.toThrow();expect(fake.parse).toHaveBeenCalledTimes(1);}
+  });
+  it('freezes approved inputs so a correction cannot inherit an in-flight caller scope mutation', async () => {
+    const options=input();options.plan=structuredClone(planned);options.context=structuredClone(context);
+    const fake=provider();fake.parse.mockReset().mockImplementationOnce(async()=>{options.plan.items[0]!.affectedPaths.push('src/outside-plan.ts');options.context.files[0]!.content='mutated outside generation';return response(sourceOnly);}).mockResolvedValueOnce(response(complete));
+    const result=await new OpenAIImplementer(options.config,{client:fake.client}).implement(options);
+    expect(result.files[0]!.content).toBe(changes().files[0]!.content);
+    const second=JSON.parse(fake.parse.mock.calls[1]![0].input);
+    expect(second.expectedChangedPaths).toEqual(['src/app.ts','tests/new.ts']);expect(second.repository.files[0].content).toBe(context.files[0]!.content);
   });
 });

@@ -20,7 +20,7 @@ const analysis: AnalysisDraft = { summary: 'Change greeting', requirements: [{ i
   acceptanceCriteria: [{ id: 'A1', text: 'returns new greeting', origin: 'derived', sourceRefs: [] }] }], questions: [] };
 const draft: PlanDraft = { summary: 'Change greeting', items: [{ id: 'P1', requirementIds: ['R1'], currentBehavior: 'old greeting',
   codeRefs: [{ path: 'src/greet.js', quote: "export const greeting = 'old';" }], proposedChanges: 'Update greeting and inspect unused helper',
-  affectedPaths: ['src/greet.js', 'src/unused.js'], dependencies: [], acceptanceChecks: [{ criterionId: 'A1', commandId: 'test', testName: 'new greeting' }], blockers: [] }], excludedRequirements: [] };
+  affectedPaths: ['src/greet.js'], dependencies: [], acceptanceChecks: [{ criterionId: 'A1', commandId: 'test', testName: 'new greeting' }], blockers: [] }], excludedRequirements: [] };
 const planner: Planner = { name: 'fixture', model: 'fixture', promptVersion: 'audit-v1', async plan() { return structuredClone(draft); } };
 const implementer: Implementer = { name: 'fixture', model: 'fixture', promptVersion: 'audit-v1', async implement() {
   return { summary: 'Update greeting', files: [{ path: 'src/greet.js', content: "export const greeting = 'new';\n" }] };
@@ -50,11 +50,11 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-it('refuses completed-run resume when another planned file has an unrecorded edit', async () => {
+it('refuses completed-run resume when an unchanged source file has an unrecorded edit', async () => {
   const options = await approved();
   const complete = await implementPlan(options);
   writeFileSync(join(complete.worktreePath, 'src/unused.js'), 'export const unused = 2;\n');
-  await expect(implementPlan({ ...options, resumeRunId: complete.runId })).rejects.toThrow(/changed|unrecorded|clean|diff/i);
+  await expect(implementPlan({ ...options, resumeRunId: complete.runId })).rejects.toThrow(/outside the approved file scope/);
 });
 
 it.each([
