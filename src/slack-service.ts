@@ -63,6 +63,17 @@ const sections = (text: string): Record<string, unknown>[] => {
   }
   return blocks;
 };
+/** Keep short proposal paragraphs separate so Slack does not fold the entire proposal into one section. */
+const proposalBlocks = (text: string): Record<string, unknown>[] => {
+  const paragraphs = text.split('\n\n');
+  const title = paragraphs[0]!;
+  const hasHeader = title.length <= 150 && !title.includes('\n') && title.startsWith('[') && title.endsWith(']');
+  const header = hasHeader ? [{ type: 'header', text: plain(title) }] : [];
+  const body = hasHeader ? paragraphs.slice(1) : paragraphs;
+  const blocks = [...header, ...body.filter(paragraph => paragraph.length > 0).flatMap(sections)];
+  // Reserve space for the details accessory and approval buttons without omitting any content.
+  return blocks.length <= 46 ? blocks : [...header, ...sections(body.join('\n\n'))];
+};
 const proposalEvidence = ({ analysis, plan }: SlackProposal): string => {
   const refs = (values: AnalysisDraft['requirements'][number]['sourceRefs']) => values.map(ref =>
     `원문 ${ref.messageVersionId}: “${ref.quote}”${analysis.evidence?.[ref.messageVersionId] ? `\n${analysis.evidence[ref.messageVersionId]!.permalink}` : ''}`).join('\n') || '(직접 인용 없음)';
@@ -430,7 +441,7 @@ export class SlackService {
       const body = proposalDetails(proposal, checkIds), blocker = proposalBlocker(proposal, checkIds);
       const tooLarge = body.length > proposalLimit, evidenceTooLarge = proposalEvidence(proposal).length > evidenceLimit;
       const text = `${tooLarge ? '제안 전체가 Slack 표시 한도를 넘었습니다. 승인할 수 없습니다. 수정 요청으로 범위를 줄이거나 로컬 보고서를 확인하세요.' : body}${blocker && !tooLarge ? `\n\n승인 대기 사유: ${blocker}` : ''}\n\n작업: ${job.id}`;
-      const blocks = sections(text);
+      const blocks = proposalBlocks(text);
       if (action?.kind === 'proposal') {
         if (!evidenceTooLarge) blocks.push({ ...section('상세 계획 · 완료 조건 · 원문과 코드 근거'),
           accessory: { type: 'button', action_id: 'sd_proposal_details', text: plain('구현 계획·근거 보기'), value: action.nonce } });

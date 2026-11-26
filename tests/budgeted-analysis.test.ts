@@ -131,7 +131,7 @@ describe('one bounded correction for exact source evidence only', () => {
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
     await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
-    expect(analyzer.promptVersion).toContain('budgeted-v4');
+    expect(analyzer.promptVersion).toContain('budgeted-v5');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     const {correction,...source} = second;
     expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
@@ -189,5 +189,30 @@ describe('one bounded correction for exact source evidence only', () => {
     fake.parse.mockReset().mockImplementationOnce(async () => {source.messages[0]!.text='호출 중 변경';return response(invalid());}).mockResolvedValueOnce(response(draft));
     await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(source)).resolves.toEqual(draft);
     expect(JSON.parse(fake.parse.mock.calls[1]![0].input).messages[0].text).toBe('버튼을 추가한다.');
+  });
+});
+
+describe('latest feedback restrictions remain source requirements', () => {
+  it('instructs file allowlists and prohibitions to survive extraction and validates their real feedback evidence', async () => {
+    const restriction = '변경 파일은 src/filter.css와 tests/filter.test.ts로 한정하고 Filter.tsx의 기능 코드는 수정하지 마세요.';
+    const source = snapshot();
+    source.messages.push({id:'latest-feedback',ts:'1795046401.000001',text:`사용자 수정 의견: ${restriction}`,author:'UBOT',editedTs:null,hasAttachments:false,
+      permalink:'https://example.slack.com/archives/CONE/p1795046401000001?thread_ts=1795046400.000001&cid=CONE'});
+    source.contentHash = snapshotContentHash(source);
+    const revised = structuredClone(draft);
+    revised.requirements.push({id:'R2',statement:restriction,decisionState:'proposed',sourceRefs:[{messageVersionId:'latest-feedback',quote:restriction}],
+      supersedesIds:[],blockingQuestionIds:[],acceptanceCriteria:[]});
+    const previousProposal = {analysis:{runId:'previous',revisionId:'old-revision',snapshotId:'old-snapshot',draft}};
+    const fake = client(revised);
+    const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client,feedback:{entries:[{id:'command:latest',actor:'UAPPROVER',text:restriction,
+      messageVersionId:'latest-feedback',previousRunId:'previous',previousRevisionId:'old-revision',previousPlanId:'old-plan'}],previousProposal}});
+    const result = await analyzer.analyze(source);
+    expect(result.requirements[1]).toMatchObject({statement:restriction,decisionState:'proposed',sourceRefs:[{messageVersionId:'latest-feedback',quote:restriction}]});
+    const request = fake.parse.mock.calls[0]![0];
+    expect(request.instructions).toContain('each named file path and each prohibition explicitly');
+    expect(request.instructions).toContain('takes precedence over stale assumptions and proposed file targets in PreviousProposal');
+    expect(request.instructions).toContain('Mentioning these constraints only in summary');
+    expect(JSON.parse(request.input).userFeedback.entries[0].text).toBe(restriction);
+    expect(fake.parse).toHaveBeenCalledTimes(1);
   });
 });

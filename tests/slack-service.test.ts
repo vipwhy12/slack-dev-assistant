@@ -235,12 +235,17 @@ describe('single-approval proposals and revision-bound feedback', () => {
     fixture.analysis.draft.requirements[0]!.sourceRefs[0]!.quote = quote;
     const { id, action } = await analyzed(fixture);
     const reply = fixture.service.handleCommand(command(`status ${id}`));
-    const sections = reply.blocks!.filter(block => block.type === 'section').map(block => (block.text as { text: string }).text).join('');
+    const sections = reply.blocks!.filter(block => ['header', 'section'].includes(block.type as string)).map(block => (block.text as { text: string }).text).join('');
     for (const value of ['[달력 접근성 개선 요구사항]', '요약', '기능 구현', '사이드 이펙트', '1. 선택한 날짜에 aria-pressed를 설정한다.',
       'src/Calendar.tsx', '스크린리더의 날짜 선택 안내가 달라질 수 있습니다.', 'web-tests', '상세 구현 계획과 완료 조건을 확인한 뒤 승인해 주세요.']) expect(sections).toContain(value);
     for (const detail of [quote, thread, 'binding-1', 'snapshot-1', 'message-1', '<button aria-pressed={selected}>', 'R1', 'AC1', '선택한 날짜만 true이다.',
       '키보드와 스크린리더로 선택 상태를 확인합니다.', '선택 상태가 시각적으로만 표시됩니다.', '날짜 버튼에 aria-pressed를 연결하고 선택 상태 테스트를 추가합니다.']) expect(sections).not.toContain(detail);
     expect(reply.text).toMatch(/^\[달력 접근성 개선 요구사항\]/);
+    expect(reply.blocks![0]).toEqual({ type: 'header', text: { type: 'plain_text', text: '[달력 접근성 개선 요구사항]', emoji: false } });
+    const contentBlocks = reply.blocks!.filter(block => ['header', 'section'].includes(block.type as string) && !block.accessory);
+    expect(contentBlocks.length).toBeGreaterThan(4);
+    expect(contentBlocks.map(block => (block.text as { text: string }).text).join('\n\n')).toBe(reply.text);
+    expect(contentBlocks.every(block => (block.text as { type: string }).type === 'plain_text')).toBe(true);
     const details = await fixture.service.handleAction({ ...identity, actionId: 'sd_proposal_details', value: action.nonce });
     expect(details.modal).toMatchObject({ callback_id: 'sd_proposal_details', private_metadata: action.nonce });
     expect(details.modal!.submit).toBeUndefined();
@@ -288,6 +293,27 @@ describe('single-approval proposals and revision-bound feedback', () => {
     const text = (detail.modal!.blocks as Array<{ text: { text: string } }>).map(block => block.text.text).join('');
     expect(text).toContain('npm test -- --run'); expect(text).toContain('npm run typecheck');
     expect(text).toContain(original.acceptanceCriteria[0]!.text); expect(text).toContain('방향키를 눌러 읽기 순서를 확인합니다.');
+  });
+  it('preserves long proposal text within Slack section and message block limits', async () => {
+    for (const manyParagraphs of [false, true]) {
+      const fixture = proposalSetup();
+      fixture.analysis.draft.summary = manyParagraphs ? Array.from({ length: 60 }, (_, index) => `문단 ${index}: 모든 내용을 보존합니다.`).join('\n\n') : '긴 기능 설명을 여러 블록으로 나눕니다.';
+      fixture.analysis.draft.requirements[0]!.statement = `${'가'.repeat(2890)}😀${'나'.repeat(3100)} <@U1> *문자 그대로*`;
+      const { id } = await analyzed(fixture);
+      const reply = fixture.service.handleCommand(command(`status ${id}`));
+      const blocks = reply.blocks!.filter(block => ['header', 'section'].includes(block.type as string) && !block.accessory);
+      const rendered = blocks.map(block => (block.text as { text: string }).text).join('');
+      expect(rendered.replace(/\s/g, '')).toBe(reply.text.replace(/\s/g, ''));
+      expect(reply.blocks!.length).toBeLessThanOrEqual(50);
+      for (const block of blocks) {
+        const text = block.text as { type: string; text: string };
+        expect(text.type).toBe('plain_text');
+        expect(text.text.length).toBeLessThanOrEqual(block.type === 'header' ? 150 : 2900);
+        expect(/[\uD800-\uDBFF]$/.test(text.text)).toBe(false);
+      }
+      expect(rendered).toContain('<@U1> *문자 그대로*');
+      expect(JSON.stringify(reply.blocks)).toContain('sd_proposal_yes');
+    }
   });
   it('queues one exact proposal approval across duplicate Y clicks and executes only in the worker', async () => {
     const fixture = proposalSetup(), { id, action } = await analyzed(fixture);
