@@ -11,6 +11,7 @@ import { BudgetLedger, type GenerationClient } from '../src/generation.js';
 import type { KnowledgeDraft } from '../src/knowledge.js';
 import { saveKnowledge } from '../src/knowledge-workflow.js';
 import { analyzeThread } from '../src/workflow.js';
+import { feedbackEcho, type FeedbackContext } from '../src/slack-feedback.js';
 
 let directory: string;
 let config: ProjectConfig;
@@ -164,7 +165,7 @@ describe('one bounded correction for source ranges and analysis relationships', 
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
     await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
-    expect(analyzer.promptVersion).toContain('budgeted-v8');
+    expect(analyzer.promptVersion).toContain('budgeted-v9');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     const {correction,...source} = second;
     expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
@@ -226,6 +227,79 @@ describe('one bounded correction for source ranges and analysis relationships', 
 });
 
 describe('latest feedback restrictions remain source requirements', () => {
+  function feedbackFixture(text = '변경 파일은 src/filter.css와 tests/filter.test.ts로 한정합니다. 기존 테스트를 보존하고 raw CSS 검사로 새 테스트를 추가합니다.') {
+    const source = snapshot();
+    const entries: FeedbackContext[] = [
+      { id: 'command:older', actor: 'UAPPROVER', text: '버튼을 추가한다.', messageVersionId: 'current-message', previousRunId: 'original', previousRevisionId: 'original-revision', previousPlanId: null },
+      { id: 'command:latest', actor: 'UAPPROVER', text, messageVersionId: 'latest-feedback', previousRunId: 'previous', previousRevisionId: 'old-revision', previousPlanId: 'old-plan' },
+    ];
+    source.messages.push({ ...source.messages[0]!, id: 'latest-feedback', ts: '1795046401.000001', text: feedbackEcho(entries[1]!), author: 'UBOT' });
+    source.contentHash = snapshotContentHash(source);
+    const reference = { messageVersionId: 'latest-feedback', startLine: 3, endLine: 3 };
+    return { source, feedback: { entries }, reference, text };
+  }
+  const response = (output: unknown) => ({ status: 'completed', output_parsed: output, output: [], usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } });
+
+  it('corrects omitted latest feedback once, preserving its concrete restrictions as an evidenced criterion', async () => {
+    const { source, feedback, reference, text } = feedbackFixture();
+    const corrected = wireDraft();
+    corrected.requirements[0]!.acceptanceCriteria = [{ id: 'AC1', text, origin: 'source', sourceRefs: [reference] }];
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(wireDraft())).mockResolvedValueOnce(response(corrected));
+    const analyzer = new BudgetedAnalyzer(config, url, { client: fake.client, feedback });
+    const result = await analyzer.analyze(source);
+    expect(result.requirements[0]!.acceptanceCriteria).toEqual([{ id: 'AC1', text, origin: 'source', sourceRefs: [{ messageVersionId: 'latest-feedback', quote: text }] }]);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    const initial = JSON.parse(fake.parse.mock.calls[0]![0].input);
+    const { correction, ...repairedSource } = JSON.parse(fake.parse.mock.calls[1]![0].input);
+    expect(repairedSource).toEqual(initial);
+    expect(correction.validationError).toContain('Latest feedback is not represented');
+    expect(correction.validationError).toContain('latest-feedback');
+    expect(analyzer.usage).toMatchObject({ inputTokens: 200, outputTokens: 40, totalTokens: 240 });
+    const ledger = new BudgetLedger(directory); try { expect(ledger.summary().requests).toBe(2); } finally { ledger.close(); }
+  });
+
+  it.each(['missing', 'header', 'footer', 'nonblocking question'] as const)('stops after one failed correction when latest feedback has only %s coverage', async coverage => {
+    const { source, feedback, reference } = feedbackFixture();
+    const unchanged = wireDraft();
+    if (coverage === 'header' || coverage === 'footer') unchanged.requirements[0]!.sourceRefs.push({ ...reference,
+      startLine: coverage === 'header' ? 1 : 5, endLine: coverage === 'header' ? 2 : 5 });
+    if (coverage === 'nonblocking question') unchanged.questions.push({ id: 'Q1', text: '변경 범위 제한을 확인할까요?', blocking: false,
+      affectedRequirementIds: ['R1'], sourceRefs: [reference] });
+    const fake = client(unchanged);
+    await expect(new BudgetedAnalyzer(config, url, { client: fake.client, feedback }).analyze(source)).rejects.toThrow('Latest feedback is not represented');
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires only the latest feedback and permits an evidenced withdrawal without requiring old feedback citations', async () => {
+    const { source, feedback, reference, text } = feedbackFixture('버튼 추가 요청은 철회합니다.');
+    const withdrawn = wireDraft();
+    withdrawn.requirements[0] = { ...withdrawn.requirements[0]!, statement: '버튼 추가 요청을 철회한다.', decisionState: 'rejected', sourceRefs: [reference] };
+    const fake = client(withdrawn);
+    const result = await new BudgetedAnalyzer(config, url, { client: fake.client, feedback }).analyze(source);
+    expect(result.requirements[0]).toMatchObject({ decisionState: 'rejected', sourceRefs: [{ messageVersionId: 'latest-feedback', quote: text }] });
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])('allows question feedback when it blocks active requirements or none remain (active: %s)', async active => {
+    const { source, feedback, reference, text } = feedbackFixture('추가할 버튼의 색상은 아직 결정하지 않았습니다.');
+    const uncertain = wireDraft();
+    uncertain.questions = [{ id: 'Q1', text: '추가할 버튼의 색상은 무엇인가요?', blocking: active, affectedRequirementIds: active ? ['R1'] : [], sourceRefs: [reference] }];
+    if (active) uncertain.requirements[0]!.blockingQuestionIds = ['Q1'];
+    else uncertain.requirements = [];
+    const fake = client(uncertain);
+    const result = await new BudgetedAnalyzer(config, url, { client: fake.client, feedback }).analyze(source);
+    expect(result.questions[0]).toMatchObject({ blocking: active, sourceRefs: [{ messageVersionId: 'latest-feedback', quote: text }] });
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the same conservative budget limit for a missing-feedback correction', async () => {
+    const { source, feedback } = feedbackFixture();
+    const constrained = { ...config, development: { budgetUsd: 0.5 } as ProjectConfig['development'] };
+    const fake = client(); fake.parse.mockResolvedValue({ status: 'completed', output_parsed: wireDraft(), output: [] });
+    await expect(new BudgetedAnalyzer(constrained, url, { client: fake.client, feedback }).analyze(source)).rejects.toThrow('API budget would be exceeded');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+
   it('instructs file allowlists and prohibitions to survive extraction and validates their real feedback evidence', async () => {
     const restriction = '변경 파일은 src/filter.css와 tests/filter.test.ts로 한정하고 Filter.tsx의 기능 코드는 수정하지 마세요.';
     const source = snapshot();
