@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configSchema, type ProjectConfig } from '../src/config.js';
 import type { AnalysisDraft } from '../src/analysis.js';
 import type { RepositoryContext } from '../src/repository.js';
-import { FilePlanner, OpenAIPlanner, PLAN_INSTRUCTIONS, generatedPlanSchema, renderPlan, validatePlan, type PlanDraft } from '../src/planning.js';
+import { FilePlanner, OpenAIPlanner, PLAN_INSTRUCTIONS, generatedPlanSchema, generatedPlanWireSchema, renderPlan, validatePlan, type PlanDraft } from '../src/planning.js';
 import { BudgetLedger, type GenerationClient } from '../src/generation.js';
 
 const directories: string[] = [];
@@ -27,6 +27,11 @@ function plan(): PlanDraft {
   return { summary: '동작 수정', items: [{ id: 'P1', requirementIds: ['R1'], currentBehavior: 'disabled',
     codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], proposedChanges: 'Enable it and add a test',
     affectedPaths: ['src/app.ts', 'tests/app.test.ts'], dependencies: [], acceptanceChecks: [{ criterionId: 'A1', commandId: 'test', testName: 'returns yes' }], blockers: [] }], excludedRequirements: ['R2'] };
+}
+function wirePlan(): ReturnType<typeof generatedPlanWireSchema.parse> {
+  const stored = plan();
+  return { ...stored, title: '기능 활성화', sideEffects: [], items: stored.items.map(item => ({ ...item,
+    codeRefs: [{ path: 'src/app.ts', startLine: 1, endLine: 1 }] })) };
 }
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
@@ -132,7 +137,8 @@ describe('planner adapters and report', () => {
   });
   it('uses structured output and sends scoped repository data without local paths or credentials', async () => {
     const generated = { ...plan(), title: '기능 활성화', sideEffects: [] };
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: generated, output: [] });
+    generated.items[0]!.codeRefs[0]!.quote = 'export const enabled = false;';
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: wirePlan(), output: [] });
     const c = config(); const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
     await expect(planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).resolves.toEqual(generated);
     const request = parse.mock.calls[0]![0];
@@ -141,12 +147,21 @@ describe('planner adapters and report', () => {
     expect(request.instructions).toContain('Do not invent generic risks');
     expect(request.instructions).toContain('sideEffects');
     expect(request.instructions).toContain('short Korean noun phrase');
+    expect(request.instructions).toContain('inclusive one-based startLine/endLine');
     expect(request).toMatchObject({ store: false, max_output_tokens: 8192, text: { format: { strict: true } } });
     expect(request.text.format).toMatchObject({ schema: { required: expect.arrayContaining(['title', 'sideEffects']) } });
     expect(request.text.format).toMatchObject({ schema: { properties: { title: { pattern: '\\S', minLength: 1, maxLength: 80 } } } });
     expect(request.input).not.toContain(context.repoPath);
     expect(request.input).not.toContain(c.storageDir);
     expect(JSON.parse(request.input).commands).toEqual([{ id: 'test' }]);
+    expect(JSON.parse(request.input).repository.files).toEqual([{ path: 'src/app.ts', lines: [
+      { number: 1, text: 'export const enabled = false;' }, { number: 2, text: '' },
+    ] }]);
+    expect(request.text.format).toMatchObject({ schema: { properties: { items: { items: { properties: {
+      codeRefs: { items: { required: ['path', 'startLine', 'endLine'], additionalProperties: false } },
+    } } } } } });
+    expect(planner.promptVersion).toBe('planning-v5');
+    expect(parse).toHaveBeenCalledTimes(1);
   });
   it('escapes untrusted markup in human-readable plans', () => {
     const p = plan(); p.summary = '<script>alert(1)</script> [visit](https://evil.test)';
@@ -165,93 +180,116 @@ describe('planner adapters and report', () => {
   });
 });
 
-describe('one bounded correction for exact code quotes only', () => {
+describe('provider line ranges become exact local code evidence', () => {
   const response = (output: unknown) => ({ status: 'completed', output_parsed: output, output: [],
     usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } });
-  const generated = (): PlanDraft => ({ ...plan(), title: '기능 활성화', sideEffects: [{
-    text: '공유 플래그의 활성 상태가 바뀔 수 있다.', codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], verification: '호출부를 확인한다.',
-  }] });
-  function invalid(): PlanDraft {
-    const draft = generated();
-    draft.items[0]!.codeRefs[0]!.quote = 'enabled = true';
-    draft.sideEffects![0]!.codeRefs[0]!.quote = 'const enabled=false;';
-    return draft;
-  }
-  it('corrects only quotes using identical context and records both budgeted requests', async () => {
-    const c = config();
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValueOnce(response(invalid())).mockResolvedValueOnce(response(generated()));
+  it.each(['\n', '\r\n'])('preserves original whitespace and Unicode for %j source endings', async ending => {
+    const c = config(); const draft = wirePlan();
+    draft.items[0]!.codeRefs = [{ path: 'src/app.ts', startLine: 2, endLine: 3 }];
+    draft.sideEffects = [{ text: '공유 값이 바뀔 수 있다.', codeRefs: [{ path: 'src/app.ts', startLine: 1, endLine: 1 }], verification: '호출부를 확인한다.' }];
+    const scoped = { ...context, files: [{ path: 'src/app.ts', content: ['// header', '\tconst enabled = false;', 'const label = "가";', ''].join(ending) }] };
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
+    const result = await new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: scoped, config: c, requirementIds: ['R1'] });
+    const quote = '\tconst enabled = false;' + ending + 'const label = "가";' + (ending === '\r\n' ? '\r' : '');
+    expect(result.items[0]!.codeRefs).toEqual([{ path: 'src/app.ts', quote }]);
+    expect(result.sideEffects).toEqual([{ ...draft.sideEffects[0], codeRefs: [{ path: 'src/app.ts', quote: '// header' + (ending === '\r\n' ? '\r' : '') }] }]);
+    expect(scoped.files[0]!.content).toContain(quote);
+    expect(result.items[0]).toEqual({ ...draft.items[0], codeRefs: [{ path: 'src/app.ts', quote }] });
+    expect(JSON.stringify(result)).not.toContain('startLine'); expect(JSON.stringify(result)).not.toContain('endLine');
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it('accepts the inclusive final line and records a single budgeted request', async () => {
+    const c = config(); const draft = wirePlan(); draft.items[0]!.codeRefs[0]!.endLine = 2;
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
-    await expect(planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).resolves.toEqual(generated());
-    expect(parse).toHaveBeenCalledTimes(2); expect(planner.promptVersion).toBe('planning-v4');
-    const first = JSON.parse(parse.mock.calls[0]![0].input), second = JSON.parse(parse.mock.calls[1]![0].input);
-    const { correction, ...source } = second;
-    expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
-    expect(correction.validationError).toBe('Plan code evidence does not match the supplied repository context');
-    expect(parse.mock.calls[1]![0]).toMatchObject({ store: false, max_output_tokens: 8192, text: { format: { name: 'implementation_plan_repair', strict: true } } });
-    expect(parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
-    expect(parse.mock.calls[1]![0].instructions).toContain('untrusted diagnostic data');
-    expect(planner.usage).toMatchObject({ inputTokens: 200, outputTokens: 40, totalTokens: 240,
-      attempts: [expect.objectContaining({ inputTokens: 100 }), expect.objectContaining({ inputTokens: 100 })] });
+    const result = await planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] });
+    expect(result.items[0]!.codeRefs[0]!.quote).toBe(context.files[0]!.content);
+    expect(planner.usage).toMatchObject({ inputTokens: 100, outputTokens: 20, totalTokens: 120 });
     const ledger = new BudgetLedger(c.storageDir);
-    try { expect(ledger.summary().requests).toBe(2); expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000144); }
+    try { expect(ledger.summary().requests).toBe(1); expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000072); }
     finally { ledger.close(); }
   });
-  it('stops after two invalid drafts without normalizing evidence or calling a third time', async () => {
-    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(invalid()));
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('Plan code evidence does not match');
-    expect(parse).toHaveBeenCalledTimes(2);
-    const ledger = new BudgetLedger(c.storageDir); try { expect(ledger.summary().requests).toBe(2); } finally { ledger.close(); }
-  });
-  it('does not send the correction if its reservation would exceed the same durable budget', async () => {
-    const c = config(); c.development!.budgetUsd = 0.5;
-    // Unknown usage keeps the first conservative reservation, leaving insufficient room for another.
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: invalid(), output: [] });
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('API budget would be exceeded');
-    expect(parse).toHaveBeenCalledTimes(1);
-    const ledger = new BudgetLedger(c.storageDir, 0.5); try { expect(ledger.summary().requests).toBe(1); } finally { ledger.close(); }
-  });
   it.each([
-    ['new evidence path', (draft: PlanDraft) => { draft.items[0]!.codeRefs[0]!.path = 'src/new.ts'; }],
-    ['outside read scope', (draft: PlanDraft) => { draft.sideEffects![0]!.codeRefs[0]!.path = 'private/app.ts'; }],
-    ['outside write scope', (draft: PlanDraft) => { draft.items[0]!.affectedPaths = ['private/app.ts']; }],
-    ['unknown dependency', (draft: PlanDraft) => { draft.items[0]!.dependencies = ['unknown']; }],
-    ['unselected requirement', (draft: PlanDraft) => { draft.items[0]!.requirementIds = ['R2']; }],
-    ['missing acceptance check', (draft: PlanDraft) => { draft.items[0]!.acceptanceChecks = []; }],
-  ])('never retries %s even when the draft also has an invalid quote', async (_name, mutate) => {
-    const c = config(); const draft = invalid(); mutate(draft);
+    { name: 'zero start', startLine: 0, endLine: 1 },
+    { name: 'zero end', startLine: 1, endLine: 0 },
+    { name: 'negative start', startLine: -1, endLine: 1 },
+    { name: 'fractional start', startLine: 1.5, endLine: 2 },
+    { name: 'fractional end', startLine: 1, endLine: 1.5 },
+    { name: 'reverse range', startLine: 2, endLine: 1 },
+    { name: 'end beyond file', startLine: 1, endLine: 3 },
+    { name: 'start beyond file', startLine: 3, endLine: 3 },
+    { name: 'blank final line', startLine: 2, endLine: 2 },
+  ])('rejects $name without another model call', async ({ startLine, endLine }) => {
+    const c = config(); const draft = wirePlan(); draft.items[0]!.codeRefs = [{ path: 'src/app.ts', startLine, endLine }];
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
     await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow();
     expect(parse).toHaveBeenCalledTimes(1);
   });
-  it('never retries a provider failure or malformed structured output', async () => {
-    const c = config(); const input = { analysis: analysis(), context, config: c, requirementIds: ['R1'] };
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockRejectedValue(new Error('500 provider failure'));
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow('500 provider failure');
-    expect(parse).toHaveBeenCalledTimes(1);
-    parse.mockReset().mockResolvedValue(response({ ...invalid(), approved: true }));
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow();
+  it.each(['   \t', 'x'.repeat(16_001)])('rejects blank or oversized selected text', async content => {
+    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(wirePlan()));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: { ...context, files: [{ path: 'src/app.ts', content }] }, config: c, requirementIds: ['R1'] })).rejects.toThrow(/line range/);
     expect(parse).toHaveBeenCalledTimes(1);
   });
-  it('rejects correction changes outside quote strings even when the new plan is otherwise valid', async () => {
-    const c = config(); const corrected = generated(); corrected.items[0]!.proposedChanges = '다른 기능을 구현한다.';
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValueOnce(response(invalid())).mockResolvedValueOnce(response(corrected));
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('may change only code quote strings');
-    expect(parse).toHaveBeenCalledTimes(2);
+  it('accepts exactly the stored quote length limit', async () => {
+    const c = config(); const content = 'x'.repeat(16_000);
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(wirePlan()));
+    const result = await new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: { ...context, files: [{ path: 'src/app.ts', content }] }, config: c, requirementIds: ['R1'] });
+    expect(result.items[0]!.codeRefs[0]!.quote).toBe(content);
   });
-  it('retains the first request usage when the single correction fails at the provider', async () => {
-    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValueOnce(response(invalid())).mockRejectedValueOnce(new Error('500 on repair'));
-    const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
-    await expect(planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('500 on repair');
-    expect(parse).toHaveBeenCalledTimes(2);
-    expect(planner.usage).toMatchObject({ inputTokens: 100, outputTokens: 20, totalTokens: 120,
-      attempts: [expect.objectContaining({ inputTokens: 100 }), null] });
+  it.each(['src/missing.ts', 'private/app.ts', 'src/../app.ts'])('rejects an unavailable or forbidden evidence path %s', async path => {
+    const c = config(); const draft = wirePlan(); draft.items[0]!.codeRefs[0]!.path = path;
+    const scoped = { ...context, files: [...context.files, { path: 'private/app.ts', content: 'private code' }] };
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context: scoped, config: c, requirementIds: ['R1'] })).rejects.toThrow(/evidence path/);
+    expect(parse).toHaveBeenCalledTimes(1);
   });
-  it('freezes the context across requests and both validations', async () => {
+  it('rejects omitted evidence and validates side-effect ranges by the same rules', async () => {
+    const c = config(); const draft = wirePlan();
+    draft.sideEffects = [{ text: '영향', codeRefs: [{ path: 'src/app.ts', startLine: 1, endLine: 3 }], verification: '확인' }];
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
+    const input = { analysis: analysis(), context, config: c, requirementIds: ['R1'] };
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).rejects.toThrow(/line range/);
+    expect(parse).toHaveBeenCalledTimes(1);
+    parse.mockReset().mockResolvedValue(response(wirePlan()));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ ...input, context: { ...context, omittedPaths: ['src/app.ts'] } })).rejects.toThrow(/evidence path/);
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it('rejects model-supplied quotes, forged content, and execution authority', async () => {
+    const c = config(); const draft = wirePlan();
+    for (const output of [
+      { ...draft, items: [{ ...draft.items[0], codeRefs: [{ ...draft.items[0]!.codeRefs[0], quote: 'forged code' }] }] },
+      { ...draft, repository: { files: [{ path: 'src/app.ts', content: 'forged code' }] } },
+      { ...draft, approved: true },
+    ]) {
+      const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(output));
+      await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow();
+      expect(parse).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('still enforces the stored plan scope after materialization', async () => {
+    const c = config(); const draft = wirePlan(); draft.items[0]!.affectedPaths = ['private/app.ts'];
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue(response(draft));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow(/write scope/);
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it('never retries provider failures or sends a request beyond the budget', async () => {
+    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockRejectedValue(new Error('500 provider failure'));
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow('500 provider failure');
+    expect(parse).toHaveBeenCalledTimes(1);
+    parse.mockReset().mockResolvedValue(response(wirePlan()));
+    const constrained = config(); constrained.development!.budgetUsd = 0.1;
+    await expect(new OpenAIPlanner(constrained, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: constrained, requirementIds: ['R1'] })).rejects.toThrow('API budget would be exceeded');
+    expect(parse).not.toHaveBeenCalled();
+    const ledger = new BudgetLedger(constrained.storageDir, 0.1); try { expect(ledger.summary().requests).toBe(0); } finally { ledger.close(); }
+  });
+  it('materializes from the frozen source despite in-flight caller changes', async () => {
     const c = config(); const input = { analysis: analysis(), context: structuredClone(context), config: c, requirementIds: ['R1'] };
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockImplementationOnce(async () => {
-      input.context.files[0]!.content = 'export const changed = true;'; return response(invalid());
-    }).mockResolvedValueOnce(response(generated()));
-    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input)).resolves.toEqual(generated());
-    expect(JSON.parse(parse.mock.calls[1]![0].input).repository.files).toEqual(context.files);
+      input.context.files[0]!.content = 'export const changed = true;'; return response(wirePlan());
+    });
+    const result = await new OpenAIPlanner(c, { client: { responses: { parse } } }).plan(input);
+    expect(result.items[0]!.codeRefs[0]!.quote).toBe('export const enabled = false;');
+    expect(JSON.parse(parse.mock.calls[0]![0].input).repository.files[0].lines[0]).toEqual({ number: 1, text: 'export const enabled = false;' });
+    expect(parse).toHaveBeenCalledTimes(1);
   });
 });
