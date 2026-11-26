@@ -148,6 +148,8 @@ describe('planner adapters and report', () => {
     expect(request.instructions).toContain('sideEffects');
     expect(request.instructions).toContain('short Korean noun phrase');
     expect(request.instructions).toContain('inclusive one-based startLine/endLine');
+    expect(request.instructions).toContain('Every file listed in affectedPaths must actually change during implementation');
+    expect(request.instructions).toContain('Read-only code evidence and impact analysis belong only in codeRefs');
     expect(request).toMatchObject({ store: false, max_output_tokens: 8192, text: { format: { strict: true } } });
     expect(request.text.format).toMatchObject({ schema: { required: expect.arrayContaining(['title', 'sideEffects']) } });
     expect(request.text.format).toMatchObject({ schema: { properties: { title: { pattern: '\\S', minLength: 1, maxLength: 80 } } } });
@@ -160,7 +162,7 @@ describe('planner adapters and report', () => {
     expect(request.text.format).toMatchObject({ schema: { properties: { items: { items: { properties: {
       codeRefs: { items: { required: ['path', 'startLine', 'endLine'], additionalProperties: false } },
     } } } } } });
-    expect(planner.promptVersion).toBe('planning-v6');
+    expect(planner.promptVersion).toBe('planning-v7');
     expect(parse).toHaveBeenCalledTimes(1);
   });
   it('escapes untrusted markup in human-readable plans', () => {
