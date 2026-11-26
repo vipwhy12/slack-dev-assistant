@@ -15,7 +15,7 @@ import { RunStore } from './store.js';
 import { checkConnection, collectSnapshot } from './connection.js';
 import { planRun, approvePlan, implementPlan } from './development.js';
 import { FilePlanner, OpenAIPlanner } from './planning.js';
-import { FileImplementer, OpenAIImplementer, BudgetLedger, IMPLEMENTATION_PROMPT_VERSION } from './generation.js';
+import { FileImplementer, OpenAIImplementer, BudgetLedger, IMPLEMENTATION_PROMPT_VERSION, implementationModel } from './generation.js';
 
 const program = new Command().name('slack-dev').version('0.2.0')
   .description('Analyze Slack discussions into evidence-linked requirement drafts.');
@@ -130,7 +130,7 @@ program.command('implement').argument('<plan-id>').addOption(configOption())
     // Instantiate the network adapter lazily: a completed checkpoint can resume without a key.
     let delegate: OpenAIImplementer | undefined;
     const implementer = options.changesFile ? new FileImplementer(options.changesFile) : {
-      name: 'openai', model: config.model, promptVersion: IMPLEMENTATION_PROMPT_VERSION,
+      name: 'openai', model: implementationModel(config), promptVersion: IMPLEMENTATION_PROMPT_VERSION,
       get usage() { return delegate?.usage; },
       async implement(input: Parameters<OpenAIImplementer['implement']>[0]) { delegate = new OpenAIImplementer(config); return delegate.implement(input); },
       async repair(input: Parameters<OpenAIImplementer['repair']>[0]) { delegate ??= new OpenAIImplementer(config); return delegate.repair(input); },

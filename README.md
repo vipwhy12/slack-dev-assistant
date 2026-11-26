@@ -114,7 +114,7 @@ node dist/cli.js history --config examples/project.json --limit 20
 }
 ```
 
-`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 분석에서는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 계획·구현에서는 변경할 Git 저장소의 경로로 반드시 지정합니다. 현재 CLI·Slack의 유료 `save`·`analyze`·`plan`·`implement`는 비용 계산을 지원하는 `gpt-4.1-mini`만 허용합니다. `save`·`analyze`는 `development` 설정 없이도 사용할 수 있습니다.
+`workspace`는 `.slack.com`을 제외한 서브도메인입니다. `storageDir`, `repoPath`는 **설정 파일 디렉터리 기준**으로 해석합니다. `repoPath`는 분석에서는 선택 사항이며 Git 커밋 정보를 기록하는 데 사용합니다. 계획·구현에서는 변경할 Git 저장소의 경로로 반드시 지정합니다. 기본 모델은 `gpt-4.1-mini`이며, `development.implementationModel`을 `gpt-4.1`로 지정하면 코드 생성·교정만 해당 모델을 사용합니다. 두 모델의 호출 비용은 같은 누적 예산으로 제한합니다. `save`·`analyze`는 `development` 설정 없이도 사용할 수 있습니다.
 
 ```sh
 node dist/cli.js analyze \

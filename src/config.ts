@@ -21,6 +21,7 @@ export const developmentSchema = z.object({
   maxChangedFiles: z.number().int().min(1).max(50).default(12),
   maxChangeBytes: z.number().int().min(256).max(262_144).default(98_304),
   budgetUsd: z.number().positive().max(10).default(10),
+  implementationModel: z.enum(['gpt-4.1-mini', 'gpt-4.1']).optional(),
 }).strict();
 
 export const slackAppSchema = z.object({

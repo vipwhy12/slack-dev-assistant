@@ -191,7 +191,7 @@ Slack의 **구현·PR 생성 승인**은 병합·운영 배포 승인을 포함�
 
 ## 8. 비용과 실패 복구
 
-현재 유료 `save`·`analyze`·`plan`·`implement`는 `gpt-4.1-mini`를 사용하고 **같은 `storageDir/budget.sqlite`에 기록된 누적 비용**을 함께 제한합니다. 기본 한도는 $10이며 `development.budgetUsd`로 더 낮게 지정할 수 있습니다. `save`·`analyze`만 사용할 때는 `development` 설정이 없어도 기본 한도를 적용합니다.
+유료 `save`·`analyze`·`plan`·`implement`는 기본적으로 `gpt-4.1-mini`를 사용합니다. `development.implementationModel: "gpt-4.1"`을 지정하면 코드 생성·교정만 해당 모델로 실행합니다. 모델이 달라도 **같은 `storageDir/budget.sqlite`에 기록된 누적 비용**을 함께 제한합니다. 기본 한도는 $10이며 `development.budgetUsd`로 더 낮게 지정할 수 있습니다. `save`·`analyze`만 사용할 때는 `development` 설정이 없어도 기본 한도를 적용합니다.
 
 ```sh
 node dist/cli.js budget --config slack-dev.config.json

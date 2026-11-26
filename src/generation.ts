@@ -157,11 +157,23 @@ export const VERIFIED_MODEL = 'gpt-4.1-mini';
 export const MAX_OUTPUT_TOKENS = 8192;
 export const MODEL_CONTEXT_TOKENS = 1_047_576;
 // Nano-dollars avoid rounding accumulation across durable reservations.
-const INPUT_RATE = 400;
-const CACHED_INPUT_RATE = 100;
-const OUTPUT_RATE = 1600;
-export const MAX_REQUEST_COST_USD = (MODEL_CONTEXT_TOKENS * INPUT_RATE + MAX_OUTPUT_TOKENS * OUTPUT_RATE) / 1e9;
-const RESERVED_NANOUSD = Math.ceil(MAX_REQUEST_COST_USD * 1e9);
+// Standard text-token prices: https://developers.openai.com/api/docs/models/gpt-4.1
+const MODEL_PRICING = {
+  'gpt-4.1-mini': { input: 400, cachedInput: 100, output: 1600 },
+  'gpt-4.1': { input: 2000, cachedInput: 500, output: 8000 },
+} as const;
+function modelPricing(model: string) {
+  if (!Object.hasOwn(MODEL_PRICING, model)) throw new Error('Paid workflows require a verified model: gpt-4.1-mini or implementation-only gpt-4.1');
+  return MODEL_PRICING[model as keyof typeof MODEL_PRICING];
+}
+export function modelMaxRequestCostUsd(model: string): number {
+  const rate = modelPricing(model);
+  return (MODEL_CONTEXT_TOKENS * rate.input + MAX_OUTPUT_TOKENS * rate.output) / 1e9;
+}
+export const MAX_REQUEST_COST_USD = modelMaxRequestCostUsd(VERIFIED_MODEL);
+export function implementationModel(config: ProjectConfig): string {
+  return config.development?.implementationModel ?? config.model;
+}
 
 /** Each reservation is committed before sending a request, including across processes/restarts. */
 export class BudgetLedger {
@@ -183,26 +195,31 @@ export class BudgetLedger {
         output_tokens INTEGER, cached_input_tokens INTEGER, request_id TEXT);
       PRAGMA user_version=1;`);
   }
-  reserve(phase: string): string {
+  reserve(phase: string, model = VERIFIED_MODEL): string {
+    const reserved = Math.ceil(modelMaxRequestCostUsd(model) * 1e9);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const { used } = this.db.prepare('SELECT COALESCE(SUM(COALESCE(settled_nanousd,reserved_nanousd)),0) AS used FROM reservations').get() as { used: number };
-      if (used + RESERVED_NANOUSD > this.limit) throw new Error('API budget would be exceeded; no request was sent');
+      if (used + reserved > this.limit) throw new Error('API budget would be exceeded; no request was sent');
       const id = randomUUID();
       this.db.prepare('INSERT INTO reservations(id,created_at,phase,model,reserved_nanousd) VALUES(?,?,?,?,?)')
-        .run(id, new Date().toISOString(), phase, VERIFIED_MODEL, RESERVED_NANOUSD);
+        .run(id, new Date().toISOString(), phase, model, reserved);
       this.db.exec('COMMIT');
       return id;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   settle(id: string, usage: ProviderUsage, requestId?: string): GenerationUsage | undefined {
+    const reservation = this.db.prepare('SELECT model, reserved_nanousd, settled_nanousd FROM reservations WHERE id=?').get(id) as
+      { model: string; reserved_nanousd: number; settled_nanousd: number | null } | undefined;
+    if (!reservation || reservation.settled_nanousd !== null || !Object.hasOwn(MODEL_PRICING, reservation.model)) return undefined;
+    const rate = modelPricing(reservation.model);
     const cached = usage.input_tokens_details?.cached_tokens ?? 0;
     if (![usage.input_tokens, usage.output_tokens, usage.total_tokens, cached].every(value => Number.isSafeInteger(value) && value >= 0)
       || cached > usage.input_tokens || usage.input_tokens > MODEL_CONTEXT_TOKENS || usage.output_tokens > MAX_OUTPUT_TOKENS
       || usage.total_tokens !== usage.input_tokens + usage.output_tokens) return undefined;
-    const cost = (usage.input_tokens - cached) * INPUT_RATE + cached * CACHED_INPUT_RATE + usage.output_tokens * OUTPUT_RATE;
+    const cost = (usage.input_tokens - cached) * rate.input + cached * rate.cachedInput + usage.output_tokens * rate.output;
     // Unknown or implausible usage retains the entire conservative reservation.
-    if (cost > RESERVED_NANOUSD) return undefined;
+    if (cost > reservation.reserved_nanousd) return undefined;
     this.db.prepare('UPDATE reservations SET settled_nanousd=?,input_tokens=?,output_tokens=?,cached_input_tokens=?,request_id=? WHERE id=? AND settled_nanousd IS NULL')
       .run(cost, usage.input_tokens, usage.output_tokens, cached, requestId ?? null, id);
     return { inputTokens: usage.input_tokens, outputTokens: usage.output_tokens, totalTokens: usage.total_tokens,
@@ -231,19 +248,25 @@ export interface GenerationOptions { apiKey?: string; client?: GenerationClient 
 export class StructuredGenerator {
   usage?: GenerationUsage;
   private readonly client: GenerationClient;
-  constructor(private readonly config: ProjectConfig, options: GenerationOptions = {}) {
+  private readonly model: string;
+  constructor(private readonly config: ProjectConfig, options: GenerationOptions = {}, purpose: 'general' | 'implementation' = 'general') {
     if (config.model !== VERIFIED_MODEL) throw new Error('Paid workflows currently require the verified model gpt-4.1-mini');
+    this.model = purpose === 'implementation' ? implementationModel(config) : config.model;
+    modelPricing(this.model);
     this.client = options.client ?? new OpenAI({ apiKey: options.apiKey, baseURL: 'https://api.openai.com/v1', maxRetries: 0, timeout: 120_000 });
   }
   async generate(schema: z.ZodType, phase: string, instructions: string, data: unknown): Promise<unknown> {
     this.usage = undefined;
+    if (this.model !== VERIFIED_MODEL && !['file_edits', 'file_edits_repair', 'file_edits_verification_repair', 'file_edits_verification_repair_anchor'].includes(phase)) {
+      throw new Error('The implementation model can only generate implementation edits');
+    }
     const input = JSON.stringify(data);
     if (Buffer.byteLength(input, 'utf8') > (this.config.development?.maxContextBytes ?? 98_304) + 131_072) throw new Error('Generation input exceeds the context limit');
     if (containsCredential(input)) throw new Error('Generation context contains a possible credential');
     const ledger = new BudgetLedger(this.config.storageDir, this.config.development?.budgetUsd ?? 10);
     try {
-      const id = ledger.reserve(phase);
-      const response = await this.client.responses.parse({ model: this.config.model, instructions, input, store: false,
+      const id = ledger.reserve(phase, this.model);
+      const response = await this.client.responses.parse({ model: this.model, instructions, input, store: false,
         max_output_tokens: MAX_OUTPUT_TOKENS, text: { format: zodTextFormat(schema, phase) } });
       if (response.usage) this.usage = ledger.settle(id, response.usage, response._request_id ?? undefined);
       if (response.status !== 'completed' || response.error || response.incomplete_details) throw new Error('Generation provider did not complete successfully');
@@ -312,7 +335,10 @@ export class OpenAIImplementer implements Implementer {
       estimatedCostUsd: known.reduce((total, usage) => total + usage.estimatedCostUsd, 0),
       attempts: this.usageAttempts.map(usage => usage ? { ...usage } : null) };
   }
-  constructor(config: ProjectConfig, options: GenerationOptions = {}) { this.model = config.model; this.generator = new StructuredGenerator(config, options); }
+  constructor(config: ProjectConfig, options: GenerationOptions = {}) {
+    this.model = implementationModel(config);
+    this.generator = new StructuredGenerator(config, options, 'implementation');
+  }
   async implement(input: ImplementationInput): Promise<ChangeSet> {
     return this.generateChanges(input);
   }
