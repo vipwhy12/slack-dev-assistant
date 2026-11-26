@@ -249,6 +249,25 @@ export interface GenerationResponse {
 export interface GenerationClient { responses: { parse(request: GenerationRequest): Promise<GenerationResponse> } }
 export interface GenerationOptions { apiKey?: string; client?: GenerationClient }
 
+// Only SDK-defined diagnostic enums may leave the provider boundary; never log response text or error messages.
+const RESPONSE_STATUSES = new Set(['completed', 'failed', 'in_progress', 'cancelled', 'queued', 'incomplete']);
+const INCOMPLETE_REASONS = new Set(['max_output_tokens', 'max_messages', 'content_filter', 'steered']);
+const RESPONSE_ERROR_CODES = new Set(['server_error', 'rate_limit_exceeded', 'invalid_prompt', 'data_residency_mismatch',
+  'bio_policy', 'misalignment_policy_violation', 'vector_store_timeout', 'invalid_image', 'invalid_image_format',
+  'invalid_base64_image', 'invalid_image_url', 'image_too_large', 'image_too_small', 'image_parse_error',
+  'image_content_policy_violation', 'invalid_image_mode', 'image_file_too_large', 'unsupported_image_media_type',
+  'empty_image_file', 'failed_to_download_image', 'image_file_not_found']);
+function diagnosticEnum(value: unknown, allowed: Set<string>): string {
+  return typeof value === 'string' && allowed.has(value) ? value : value == null ? 'missing' : 'unrecognized';
+}
+function providerDiagnostics(response: GenerationResponse): string {
+  const field = (value: unknown, key: string) => typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : undefined;
+  const details = [`status=${diagnosticEnum(response.status, RESPONSE_STATUSES)}`];
+  if (response.error) details.push(`error_code=${diagnosticEnum(field(response.error, 'code'), RESPONSE_ERROR_CODES)}`);
+  if (response.incomplete_details) details.push(`incomplete_reason=${diagnosticEnum(field(response.incomplete_details, 'reason'), INCOMPLETE_REASONS)}`);
+  return details.join('; ');
+}
+
 export class StructuredGenerator {
   usage?: GenerationUsage;
   private readonly client: GenerationClient;
@@ -273,10 +292,12 @@ export class StructuredGenerator {
       const response = await this.client.responses.parse({ model: this.model, instructions, input, store: false,
         max_output_tokens: MAX_OUTPUT_TOKENS, text: { format: zodTextFormat(schema, phase) } });
       if (response.usage) this.usage = ledger.settle(id, response.usage, response._request_id ?? undefined);
-      if (response.status !== 'completed' || response.error || response.incomplete_details) throw new Error('Generation provider did not complete successfully');
+      const refused = Array.isArray(response.output) && response.output.some(item => Array.isArray(item.content) && item.content.some((content: unknown) =>
+        typeof content === 'object' && content !== null && 'type' in content && content.type === 'refusal'));
+      if (refused) throw new Error(`Generation provider refused the request (${providerDiagnostics(response)}; refusal=true)`);
+      if (response.status !== 'completed' || response.error || response.incomplete_details) throw new Error(`Generation provider did not complete successfully (${providerDiagnostics(response)})`);
       for (const item of response.output) {
-        if (item.type === 'message' && item.status && item.status !== 'completed') throw new Error('Generation provider returned an incomplete message');
-        if (Array.isArray(item.content) && item.content.some((content: unknown) => typeof content === 'object' && content !== null && 'type' in content && content.type === 'refusal')) throw new Error('Generation provider refused the request');
+        if (item.type === 'message' && item.status && item.status !== 'completed') throw new Error(`Generation provider returned an incomplete message (${providerDiagnostics(response)}; message_status=${diagnosticEnum(item.status, RESPONSE_STATUSES)})`);
       }
       if (response.output_parsed == null) throw new Error('Generation provider returned no structured output');
       return schema.parse(response.output_parsed);

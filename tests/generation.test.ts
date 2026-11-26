@@ -125,6 +125,44 @@ describe('paid transport boundary using mocked requests only', () => {
     const c = config(); const { client } = provider(overrides);
     await expect(new StructuredGenerator(c, { client }).generate(schema, 'plan', 'instructions', {})).rejects.toThrow();
   });
+  it.each(['max_output_tokens', 'content_filter', 'max_messages', 'steered'])('reports the safe incomplete reason %s without another request', async reason => {
+    const c = config(); const { client, parse } = provider({ status: 'incomplete', incomplete_details: { reason },
+      usage: { input_tokens: 100, output_tokens: 200, total_tokens: 300 } });
+    const generator = new StructuredGenerator(c, { client });
+    await expect(generator.generate(schema, 'plan', 'instructions', {})).rejects.toThrow(`Generation provider did not complete successfully (status=incomplete; incomplete_reason=${reason})`);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(generator.usage?.estimatedCostUsd).toBe(0.00036);
+    const ledger = new BudgetLedger(c.storageDir); try { expect(ledger.summary()).toMatchObject({ requests: 1, reservedOrSpentUsd: 0.00036 }); } finally { ledger.close(); }
+  });
+  it('reports only the known provider error code and suppresses its private message and response body', async () => {
+    const c = config(); const privateText = `private source sk-${'x'.repeat(30)}`;
+    const { client, parse } = provider({ status: 'failed', error: { code: 'server_error', message: privateText, param: privateText },
+      output: [{ type: 'message', content: [{ type: 'output_text', text: privateText }] }] });
+    const failure = await new StructuredGenerator(c, { client }).generate(schema, 'plan', 'instructions', {}).catch(error => error as Error);
+    expect((failure as Error).message).toBe('Generation provider did not complete successfully (status=failed; error_code=server_error)');
+    expect(parse).toHaveBeenCalledTimes(1);
+    const ledger = new BudgetLedger(c.storageDir); try { expect(ledger.summary()).toMatchObject({ requests: 1, reservedOrSpentUsd: MAX_REQUEST_COST_USD }); } finally { ledger.close(); }
+  });
+  it('distinguishes a refusal even on an incomplete response without exposing its explanation', async () => {
+    const c = config(); const { client, parse } = provider({ status: 'incomplete', incomplete_details: { reason: 'content_filter' },
+      output: [{ type: 'message', status: 'incomplete', content: [{ type: 'refusal', refusal: 'private refusal explanation' }] }] });
+    const failure = await new StructuredGenerator(c, { client }).generate(schema, 'plan', 'instructions', {}).catch(error => error as Error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe('Generation provider refused the request (status=incomplete; incomplete_reason=content_filter; refusal=true)');
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it.each(['private_short_code', `sk-${'a'.repeat(30)}`, 'incomplete\nprivate detail', 'x'.repeat(10000)])('never echoes unrecognized diagnostic values', async value => {
+    const c = config(); const { client } = provider({ status: value, error: { code: value, message: value }, incomplete_details: { reason: value } });
+    const failure = await new StructuredGenerator(c, { client }).generate(schema, 'plan', 'instructions', {}).catch(error => error as Error);
+    expect((failure as Error).message).toBe('Generation provider did not complete successfully (status=unrecognized; error_code=unrecognized; incomplete_reason=unrecognized)');
+  });
+  it('reports incomplete message status through the same allowlist', async () => {
+    for (const [status, expected] of [['incomplete', 'incomplete'], ['private_status', 'unrecognized']]) {
+      const c = config(); const { client, parse } = provider({ output: [{ type: 'message', status, content: [] }] });
+      await expect(new StructuredGenerator(c, { client }).generate(schema, 'plan', 'instructions', {})).rejects.toThrow(`Generation provider returned an incomplete message (status=completed; message_status=${expected})`);
+      expect(parse).toHaveBeenCalledTimes(1);
+    }
+  });
   it('replays implementations and validates mocked implementation output', async () => {
     const c = config(); const input = { analysis: { summary: '한글', requirements: [], questions: [] }, plan, context, config: c };
     const file = join(c.storageDir, 'changes.json'); writeFileSync(file, JSON.stringify(changes()));
