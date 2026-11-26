@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { BudgetedAnalyzer } from '../src/budgeted-analysis.js';
+import { BudgetedAnalyzer, budgetedAnalysisWireSchema } from '../src/budgeted-analysis.js';
 import type { AnalysisDraft } from '../src/analysis.js';
 import type { ProjectConfig } from '../src/config.js';
 import { snapshotContentHash, type ThreadSnapshot } from '../src/domain.js';
@@ -25,7 +25,13 @@ function snapshot(channelId = 'CONE', text = '버튼을 추가한다.', id = 'cu
 }
 const draft: AnalysisDraft = {title: '버튼 추가', summary: '버튼 추가', requirements: [{id: 'R1', statement: '버튼을 추가한다.', decisionState: 'proposed',
   sourceRefs: [{messageVersionId: 'current-message', quote: '버튼을 추가한다.'}], supersedesIds: [], blockingQuestionIds: [], acceptanceCriteria: []}], questions: []};
-function client(output: unknown = draft) {
+function wireDraft(value: AnalysisDraft = draft): ReturnType<typeof budgetedAnalysisWireSchema.parse> {
+  const ref = ({ messageVersionId }: { messageVersionId: string }) => ({ messageVersionId, startLine: 1, endLine: 1 });
+  return { ...value, title: value.title ?? '버튼 추가', requirements: value.requirements.map(requirement => ({ ...requirement,
+    sourceRefs: requirement.sourceRefs.map(ref), acceptanceCriteria: requirement.acceptanceCriteria.map(criterion => ({ ...criterion, sourceRefs: criterion.sourceRefs.map(ref) })) })),
+    questions: value.questions.map(question => ({ ...question, sourceRefs: question.sourceRefs.map(ref) })) };
+}
+function client(output: unknown = wireDraft()) {
   const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({status: 'completed', output_parsed: output, output: [], usage: {input_tokens: 100, output_tokens: 20, total_tokens: 120}});
   return {parse, client: {responses: {parse}}};
 }
@@ -57,7 +63,12 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     expect(request.input).not.toContain('나머지 메시지 본문은 불필요합니다.');
     expect(request.input).not.toContain(directory);
     expect(request.instructions).toContain('never an approval or authoritative requirement');
-    expect(request.instructions).toContain('Every sourceRef must still cite an exact quote from messages in the current snapshot');
+    expect(request.instructions).toContain('Every sourceRef must select numbered lines from a message in the current snapshot');
+    expect(JSON.parse(request.input).messages[0].lines).toEqual([{ number: 1, text: '버튼을 추가한다.' }]);
+    expect(JSON.parse(request.input).messages[0]).not.toHaveProperty('text');
+    expect(request.text.format).toMatchObject({ schema: { properties: { requirements: { items: { properties: {
+      sourceRefs: { items: { required: ['messageVersionId', 'startLine', 'endLine'], additionalProperties: false } },
+    } } } } } });
     const ledger = new BudgetLedger(directory); try { expect(ledger.summary()).toMatchObject({limitUsd: 10, requests: 1}); } finally {ledger.close();}
   });
   it('caps supplemental context at 20 items and 32 KiB independently of source size', async () => {
@@ -96,8 +107,8 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     expect(fake.parse.mock.calls[0]![0].input).not.toContain('unbound');
   });
   it('rejects references to supplemental knowledge as current-thread evidence', async () => {
-    await save(); const output = structuredClone(draft);
-    output.requirements[0]!.sourceRefs = [{messageVersionId: 'knowledge-CONE', quote: '원문 근거입니다.'}];
+    await save(); const output = wireDraft();
+    output.requirements[0]!.sourceRefs = [{messageVersionId: 'knowledge-CONE', startLine: 1, endLine: 1}];
     const fake = client(output);
     await expect(new BudgetedAnalyzer(config, url, {client: fake.client}).analyze(snapshot())).rejects.toThrow('Unknown evidence');
   });
@@ -112,30 +123,30 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     const ledger = new BudgetLedger(directory); try {expect(ledger.summary().requests).toBe(0);} finally {ledger.close();}
   });
   it('rejects model-generated approval fields and oversized current context', async () => {
-    await expect(new BudgetedAnalyzer(config, url, {client: client({...draft, approved: true}).client}).analyze(snapshot())).rejects.toThrow();
+    await expect(new BudgetedAnalyzer(config, url, {client: client({...wireDraft(), approved: true}).client}).analyze(snapshot())).rejects.toThrow();
     const fake = client();
     await expect(new BudgetedAnalyzer(config, url, {client: fake.client}).analyze(snapshot('CONE', 'x'.repeat(230_000)))).rejects.toThrow('context limit');
     expect(fake.parse).not.toHaveBeenCalled();
   });
 });
 
-describe('one bounded correction for exact source evidence only', () => {
+describe('one bounded correction for source ranges and analysis relationships', () => {
   const response = (output: unknown, usage = {input_tokens:100,output_tokens:20,total_tokens:120}) => ({status:'completed',output_parsed:output,output:[],usage});
   function invalid() {
-    const output = structuredClone(draft);
-    output.requirements[0]!.sourceRefs[0]!.quote = '버튼을 추가하세요.';
+    const output = wireDraft();
+    output.requirements[0]!.sourceRefs[0]!.endLine = 2;
     return output;
   }
-  it('corrects one invalid quote with the identical source and records both budgeted requests', async () => {
-    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(invalid())).mockResolvedValueOnce(response(draft));
+  it('corrects one invalid range with the identical source and records both budgeted requests', async () => {
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(invalid())).mockResolvedValueOnce(response(wireDraft()));
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
     await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
-    expect(analyzer.promptVersion).toContain('budgeted-v5');
+    expect(analyzer.promptVersion).toContain('budgeted-v6');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     const {correction,...source} = second;
     expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
-    expect(correction.validationError).toContain('Evidence quote does not match');
+    expect(correction.validationError).toContain('Evidence line range is invalid');
     expect(fake.parse.mock.calls[1]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'slack_requirements_repair'}}});
     expect(fake.parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
     expect(fake.parse.mock.calls[1]![0].instructions).toContain('untrusted diagnostic data');
@@ -145,15 +156,15 @@ describe('one bounded correction for exact source evidence only', () => {
     const ledger = new BudgetLedger(directory); try {expect(ledger.summary().requests).toBe(2);expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000144);} finally {ledger.close();}
   });
   it('permits one correction of an unknown message ID but never accepts evidence outside the snapshot', async () => {
-    const output = structuredClone(draft); output.requirements[0]!.sourceRefs[0]!.messageVersionId = 'not-in-this-thread';
-    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(output)).mockResolvedValueOnce(response(draft));
+    const output = wireDraft(); output.requirements[0]!.sourceRefs[0]!.messageVersionId = 'not-in-this-thread';
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(output)).mockResolvedValueOnce(response(wireDraft()));
     await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
     expect(JSON.parse(fake.parse.mock.calls[1]![0].input).correction.validationError).toContain('Unknown evidence');
   });
   it('stops after two invalid drafts without string normalization or a third model request', async () => {
     const fake = client(invalid());
-    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('Evidence quote does not match');
+    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('Evidence line range is invalid');
     expect(fake.parse).toHaveBeenCalledTimes(2);
     const ledger = new BudgetLedger(directory); try {expect(ledger.summary().requests).toBe(2);} finally {ledger.close();}
   });
@@ -165,17 +176,17 @@ describe('one bounded correction for exact source evidence only', () => {
     expect(fake.parse).toHaveBeenCalledTimes(1);
     const ledger = new BudgetLedger(directory,0.5); try {expect(ledger.summary().requests).toBe(1);} finally {ledger.close();}
   });
-  it('never retries network/provider failures, malformed schema, or other analysis invariants', async () => {
+  it('never retries network/provider failures or malformed schema and bounds semantic correction', async () => {
     const fake = client(); fake.parse.mockRejectedValue(new Error('500 provider failure'));
     await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('500 provider failure');
     expect(fake.parse).toHaveBeenCalledTimes(1);
-    const malformed = client({...draft,approved:true});
+    const malformed = client({...wireDraft(),approved:true});
     await expect(new BudgetedAnalyzer(config,url,{client:malformed.client}).analyze(snapshot())).rejects.toThrow();
     expect(malformed.parse).toHaveBeenCalledTimes(1);
-    const duplicate = structuredClone(draft); duplicate.requirements.push(structuredClone(duplicate.requirements[0]!));
+    const duplicate = wireDraft(); duplicate.requirements.push(structuredClone(duplicate.requirements[0]!));
     const other = client(duplicate);
     await expect(new BudgetedAnalyzer(config,url,{client:other.client}).analyze(snapshot())).rejects.toThrow();
-    expect(other.parse).toHaveBeenCalledTimes(1);
+    expect(other.parse).toHaveBeenCalledTimes(2);
   });
   it('never retries a correction request that itself fails at the provider', async () => {
     const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(invalid())).mockRejectedValueOnce(new Error('500 on repair'));
@@ -186,9 +197,9 @@ describe('one bounded correction for exact source evidence only', () => {
   });
   it('freezes the source so an in-flight caller mutation cannot replace the validation evidence', async () => {
     const source = snapshot(); const fake = client();
-    fake.parse.mockReset().mockImplementationOnce(async () => {source.messages[0]!.text='호출 중 변경';return response(invalid());}).mockResolvedValueOnce(response(draft));
+    fake.parse.mockReset().mockImplementationOnce(async () => {source.messages[0]!.text='호출 중 변경';return response(invalid());}).mockResolvedValueOnce(response(wireDraft()));
     await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(source)).resolves.toEqual(draft);
-    expect(JSON.parse(fake.parse.mock.calls[1]![0].input).messages[0].text).toBe('버튼을 추가한다.');
+    expect(JSON.parse(fake.parse.mock.calls[1]![0].input).messages[0].lines).toEqual([{ number: 1, text: '버튼을 추가한다.' }]);
   });
 });
 
@@ -203,16 +214,76 @@ describe('latest feedback restrictions remain source requirements', () => {
     revised.requirements.push({id:'R2',statement:restriction,decisionState:'proposed',sourceRefs:[{messageVersionId:'latest-feedback',quote:restriction}],
       supersedesIds:[],blockingQuestionIds:[],acceptanceCriteria:[]});
     const previousProposal = {analysis:{runId:'previous',revisionId:'old-revision',snapshotId:'old-snapshot',draft}};
-    const fake = client(revised);
+    const fake = client(wireDraft(revised));
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client,feedback:{entries:[{id:'command:latest',actor:'UAPPROVER',text:restriction,
       messageVersionId:'latest-feedback',previousRunId:'previous',previousRevisionId:'old-revision',previousPlanId:'old-plan'}],previousProposal}});
     const result = await analyzer.analyze(source);
-    expect(result.requirements[1]).toMatchObject({statement:restriction,decisionState:'proposed',sourceRefs:[{messageVersionId:'latest-feedback',quote:restriction}]});
+    expect(result.requirements[1]).toMatchObject({statement:restriction,decisionState:'proposed',sourceRefs:[{messageVersionId:'latest-feedback',quote:`사용자 수정 의견: ${restriction}`}]});
     const request = fake.parse.mock.calls[0]![0];
     expect(request.instructions).toContain('each named file path and each prohibition explicitly');
     expect(request.instructions).toContain('takes precedence over stale assumptions and proposed file targets in PreviousProposal');
     expect(request.instructions).toContain('Mentioning these constraints only in summary');
     expect(JSON.parse(request.input).userFeedback.entries[0].text).toBe(restriction);
     expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('numbered Slack source materialization', () => {
+  it.each(['\n', '\r\n'])('materializes requirement, criterion and question references without changing %j source text', async ending => {
+    const text = ['첫 줄', '\t버튼을 추가한다.', '가 표시는 어떻게 할까요?', ''].join(ending);
+    const source = snapshot('CONE', text); const wire = wireDraft();
+    wire.requirements[0]!.sourceRefs = [{ messageVersionId: 'current-message', startLine: 2, endLine: 3 }];
+    wire.requirements[0]!.acceptanceCriteria = [{ id: 'A1', text: '버튼 추가', origin: 'source', sourceRefs: [{ messageVersionId: 'current-message', startLine: 2, endLine: 2 }] }];
+    wire.questions = [{ id: 'Q1', text: '표시 방법', blocking: false, affectedRequirementIds: ['R1'], sourceRefs: [{ messageVersionId: 'current-message', startLine: 3, endLine: 4 }] }];
+    const fake = client(wire); const result = await new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(source);
+    const cr = ending === '\r\n' ? '\r' : '';
+    expect(result.requirements[0]!.sourceRefs).toEqual([{ messageVersionId: 'current-message', quote: '\t버튼을 추가한다.' + ending + '가 표시는 어떻게 할까요?' + cr }]);
+    expect(result.requirements[0]!.acceptanceCriteria[0]!.sourceRefs).toEqual([{ messageVersionId: 'current-message', quote: '\t버튼을 추가한다.' + cr }]);
+    expect(result.questions[0]!.sourceRefs).toEqual([{ messageVersionId: 'current-message', quote: '가 표시는 어떻게 할까요?' + ending }]);
+    expect(JSON.stringify(result)).not.toContain('startLine'); expect(JSON.stringify(result)).not.toContain('endLine');
+    expect(JSON.parse(fake.parse.mock.calls[0]![0].input).messages[0].lines[1]).toEqual({ number: 2, text: '\t버튼을 추가한다.' + cr });
+    expect(source.messages[0]!.text).toBe(text); expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { startLine: 0, endLine: 1, calls: 1 }, { startLine: 1, endLine: 0, calls: 1 },
+    { startLine: 1.5, endLine: 2, calls: 1 }, { startLine: 1, endLine: 1.5, calls: 1 },
+    { startLine: 2, endLine: 1, calls: 2 }, { startLine: 1, endLine: 2, calls: 2 },
+  ])('rejects invalid range $startLine..$endLine with only one semantic correction', async ({ startLine, endLine, calls }) => {
+    const wire = wireDraft(); wire.requirements[0]!.sourceRefs[0] = { messageVersionId: 'current-message', startLine, endLine };
+    const fake = client(wire);
+    await expect(new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot())).rejects.toThrow();
+    expect(fake.parse).toHaveBeenCalledTimes(calls);
+  });
+  it.each([' \t', 'x'.repeat(16_001)])('rejects blank or oversized source ranges', async text => {
+    const fake = client();
+    await expect(new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot('CONE', text))).rejects.toThrow(/Evidence line range/);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+  });
+  it('accepts the exact 16000-character quote limit without rewriting the original', async () => {
+    const text = 'ᄀ'.repeat(16_000); const fake = client();
+    const result = await new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot('CONE', text));
+    expect(result.requirements[0]!.sourceRefs[0]!.quote).toBe(text);
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+  it('rejects provider-supplied quotes instead of accepting a second source of truth', async () => {
+    const wire = wireDraft(); const fake = client({ ...wire, requirements: [{ ...wire.requirements[0], sourceRefs: [
+      { ...wire.requirements[0]!.sourceRefs[0], quote: '모델이 바꾼 원문' },
+    ] }] });
+    await expect(new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot())).rejects.toThrow();
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+  it('corrects a source criterion missing evidence and still validates all final references', async () => {
+    const wire = wireDraft(); wire.requirements[0]!.acceptanceCriteria = [{ id: 'A1', text: '버튼 추가', origin: 'source', sourceRefs: [] }];
+    const corrected = structuredClone(wire); corrected.requirements[0]!.acceptanceCriteria[0]!.sourceRefs = [{ messageVersionId: 'current-message', startLine: 1, endLine: 1 }];
+    const fake = client(); fake.parse.mockReset()
+      .mockResolvedValueOnce({ status: 'completed', output_parsed: wire, output: [] })
+      .mockResolvedValueOnce({ status: 'completed', output_parsed: corrected, output: [] });
+    const result = await new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot());
+    expect(result.requirements[0]!.acceptanceCriteria[0]!.sourceRefs).toEqual(draft.requirements[0]!.sourceRefs);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    corrected.questions = [{ id: 'Q1', text: '질문', blocking: false, affectedRequirementIds: [], sourceRefs: [{ messageVersionId: 'outside', startLine: 1, endLine: 1 }] }];
+    fake.parse.mockReset().mockResolvedValueOnce({ status: 'completed', output_parsed: wire, output: [] }).mockResolvedValueOnce({ status: 'completed', output_parsed: corrected, output: [] });
+    await expect(new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(snapshot())).rejects.toThrow('Unknown evidence');
+    expect(fake.parse).toHaveBeenCalledTimes(2);
   });
 });

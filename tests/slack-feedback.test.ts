@@ -70,7 +70,8 @@ describe('feedback analysis provenance and cache binding', () => {
   }
   function fixture() {
     const config = configSchema.parse({projectId:'one',storageDir:directory,model:'gpt-4.1-mini',slack:{workspace:'example',channelIds:['CONE']}});
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({status:'completed',output_parsed:draft,output:[],usage:{input_tokens:100,output_tokens:10,total_tokens:110}});
+    const wire = {...draft,requirements:draft.requirements.map(requirement=>({...requirement,sourceRefs:[{messageVersionId:'F1',startLine:3,endLine:3}]}))};
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({status:'completed',output_parsed:wire,output:[],usage:{input_tokens:100,output_tokens:10,total_tokens:110}});
     return {config,parse,client:{responses:{parse}}};
   }
   it('preserves exact echo source links and separates authenticated feedback from prior generated proposals', async () => {
