@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { BudgetedAnalyzer, budgetedAnalysisWireSchema } from '../src/budgeted-analysis.js';
 import type { AnalysisDraft } from '../src/analysis.js';
-import type { ProjectConfig } from '../src/config.js';
+import { configSchema, type ProjectConfig } from '../src/config.js';
 import { snapshotContentHash, type ThreadSnapshot } from '../src/domain.js';
 import { BudgetLedger, type GenerationClient } from '../src/generation.js';
 import type { KnowledgeDraft } from '../src/knowledge.js';
@@ -128,6 +128,27 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     await expect(new BudgetedAnalyzer(config, url, {client: fake.client}).analyze(snapshot('CONE', 'x'.repeat(230_000)))).rejects.toThrow('context limit');
     expect(fake.parse).not.toHaveBeenCalled();
   });
+  it('delegates code investigation only when repository planning is configured and retains real blocking decisions', async () => {
+    const configured = configSchema.parse({ ...config, repoPath: '/unused', development: { readPaths: ['src'], writePaths: ['src'],
+      commands: [{ id: 'test', program: 'node', args: ['--test'] }], dockerImage: 'node:24' } });
+    const wire = wireDraft(); wire.requirements[0]!.blockingQuestionIds = ['Q1'];
+    wire.questions = [{ id: 'Q1', text: '새 색상은 무엇인가요?', blocking: true, affectedRequirementIds: ['R1'],
+      sourceRefs: [{ messageVersionId: 'current-message', startLine: 1, endLine: 1 }] }];
+    const fake = client(wire); const analyzer = new BudgetedAnalyzer(configured, url, { client: fake.client });
+    const result = await analyzer.analyze(snapshot('CONE', '색상은 아직 정하지 않았습니다. 현재 코드를 조사해 영향을 정리해 주세요.'));
+    const instructions = fake.parse.mock.calls[0]![0].instructions;
+    expect(instructions).toContain('Repository investigation is available in the next planning phase');
+    expect(instructions).toContain('Do not create a blocking question solely because this analysis input lacks repository code');
+    expect(instructions).toContain('Do not invent code contents or impacts');
+    expect(instructions).toContain('unspecified color, conflicting requirements, and necessary external links or attachments');
+    expect(result.questions[0]).toMatchObject({ id: 'Q1', blocking: true, affectedRequirementIds: ['R1'] });
+    for (const incomplete of [{ ...configured, repoPath: undefined }, { ...configured, development: undefined }]) {
+      const other = client(); const withoutPlanning = new BudgetedAnalyzer(incomplete, url, { client: other.client });
+      await withoutPlanning.analyze(snapshot());
+      expect(other.parse.mock.calls[0]![0].instructions).not.toContain('Repository investigation is available in the next planning phase');
+      expect(withoutPlanning.promptVersion).not.toBe(analyzer.promptVersion);
+    }
+  });
 });
 
 describe('one bounded correction for source ranges and analysis relationships', () => {
@@ -142,7 +163,7 @@ describe('one bounded correction for source ranges and analysis relationships', 
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
     await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
-    expect(analyzer.promptVersion).toContain('budgeted-v6');
+    expect(analyzer.promptVersion).toContain('budgeted-v7');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     const {correction,...source} = second;
     expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());

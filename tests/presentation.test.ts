@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { AnalysisDraft } from '../src/analysis.js';
 import type { ThreadSnapshot } from '../src/domain.js';
 import type { PlanDraft } from '../src/planning.js';
-import { renderImplementationReport, renderPullRequestBody, renderPullRequestTitle, renderSideEffects, type ImplementationPresentation } from '../src/presentation.js';
+import { markdownText, renderImplementationReport, renderPullRequestBody, renderPullRequestTitle, renderSideEffects, type ImplementationPresentation } from '../src/presentation.js';
 
 const secretMessage = '비공개 고객의 결제 내역을 숨겨 주세요.';
 const source: AnalysisDraft = { summary: '달력 선택 상태 수정', requirements: [{ id: 'REQ-CALENDAR', statement: '선택한 날짜를 표시한다.',
@@ -46,6 +46,62 @@ describe('Korean implementation documents', () => {
     expect(body).toContain('코드 근거:'); expect(body).toContain('확인 방법:');
     expect(body).toContain('추론한 영향'); expect(body).toContain('| 변경 전 | unit | 통과 | 0 |');
     expect(body).toContain('미실행 (수동 확인 필요)'); expect(body).toContain('slack-dev-run: run-123');
+  });
+  it('puts numbered changes and impact checks first while preserving prior behavior and code quotes in details', () => {
+    const value = input();
+    value.plan.items.push({ ...structuredClone(value.plan.items[0]!), id: 'P2', requirementIds: ['REQ-KEYBOARD'],
+      currentBehavior: '키보드로 선택한 날짜를 구별하기 어렵다.', proposedChanges: '키보드로 선택한 날짜에도 선택 상태를 표시한다.',
+      affectedPaths: ['src/Keyboard.tsx'], blockers: ['키보드 이동을 수동 확인한다.'] });
+    value.plan.sideEffects![0]!.codeRefs.push({ path: 'src/Calendar.tsx', quote: 'const selectedDate = dates[currentIndex];' });
+    const body = renderPullRequestBody({ ...value, planId: 'plan-123' });
+    const detailStart = body.indexOf('<details>');
+    const main = body.slice(0, detailStart);
+    const details = body.slice(detailStart, body.indexOf('</details>'));
+    expect(body).toContain('\n\n<details>\n<summary>변경 전 동작·추적 정보와 코드 근거</summary>\n\n### 기능 구현 상세\n\n');
+    expect(body).toContain('\n\n</details>\n\n## 검토 정보');
+    for (const [index, item] of value.plan.items.entries()) {
+      expect(main).toContain(`${index + 1}. ${markdownText(item.proposedChanges)}`);
+      for (const path of item.affectedPaths) expect(main).toContain(markdownText(path));
+      for (const blocker of item.blockers) expect(main).toContain(markdownText(blocker));
+      expect(main).not.toContain(markdownText(item.currentBehavior));
+      expect(details).toContain(markdownText(item.currentBehavior));
+      for (const id of item.requirementIds) {
+        expect(main).not.toContain(markdownText(id));
+        expect(details).toContain(markdownText(id));
+      }
+    }
+    for (const effect of value.plan.sideEffects!) {
+      expect(main).toContain(markdownText(effect.text));
+      expect(main).toContain(`확인 방법: ${markdownText(effect.verification)}`);
+      for (const ref of effect.codeRefs) {
+        expect(main).toContain(markdownText(ref.path));
+        expect(main).not.toContain(markdownText(ref.quote));
+        expect(details).toContain(markdownText(ref.quote));
+      }
+    }
+    expect(main.match(/코드 근거: src\\\/Calendar\\\.tsx/g)).toHaveLength(1);
+    expect(main).toContain('## 실제 검증 결과');
+    expect(main).toContain('| 변경 후 | unit | 통과 | 0 |');
+    const local = renderImplementationReport(value);
+    expect(local).toContain(markdownText(value.plan.items[0]!.currentBehavior));
+    expect(local).toContain(markdownText(value.plan.sideEffects![0]!.codeRefs[1]!.quote));
+    expect(local).not.toContain('<details>');
+  });
+  it('escapes detail content and keeps Slack links and credentials out of the collapsed PR section', () => {
+    const value = input();
+    const credential = 'sk-' + 'x'.repeat(25);
+    const unsafe = `</details><script>alert(1)</script> @org/team ${snapshot.messages[0]!.permalink}`;
+    value.plan.items[0]!.currentBehavior = unsafe;
+    value.plan.items[0]!.requirementIds = ['REQ-<@U123>'];
+    value.plan.sideEffects![0]!.codeRefs = [{ path: 'src/Calendar.tsx', quote: unsafe },
+      { path: 'src/secret.ts', quote: credential }];
+    const body = renderPullRequestBody({ ...value, planId: 'plan-123' });
+    expect(body.match(/<\/details>/g)).toHaveLength(1);
+    expect(body).not.toContain('<script>'); expect(body).not.toContain('@');
+    expect(body).not.toContain('private.slack.com'); expect(body).not.toContain(credential);
+    expect(body).not.toContain(secretMessage); expect(body).not.toContain('결제 내역을 숨겨 주세요.');
+    expect(body).toContain(markdownText(unsafe));
+    expect(body).toContain(markdownText('[민감정보를 포함해 본문 생략]'));
   });
   it('does not describe absent impact analysis as no side effects', () => {
     const value = input(); delete value.plan.sideEffects;

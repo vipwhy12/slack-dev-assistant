@@ -35,23 +35,43 @@ export function requirementsTitle(summary: string): string {
   const short = line.length > 64 ? `${line.slice(0, 63)}…` : line;
   return `[${short.replace(/[\[\]]/g, '').replace(/요구사항\s*$/, '').trim()} 요구사항]`;
 }
-export function renderSideEffects(plan: PlanDraft, text: TextFormatter = markdownText): string[] {
+export function renderSideEffects(plan: PlanDraft, text: TextFormatter = markdownText, options: { includeQuotes?: boolean } = {}): string[] {
   const lines = ['## 사이드 이펙트', ''];
   if (!plan.sideEffects?.length) return [...lines, '이 계획에는 코드 근거를 갖춘 영향 분석이 기록되지 않았습니다. 변경 후 영향을 별도로 확인해야 합니다.', ''];
   for (const effect of plan.sideEffects) {
-    lines.push(`- ${text(effect.text)}`, '', ...effect.codeRefs.map(ref => `  - 코드 근거: ${text(ref.path)} / ${text(ref.quote)}`),
+    const evidence = options.includeQuotes === false
+      ? [...new Set(effect.codeRefs.map(ref => ref.path))].map(path => `  - 코드 근거: ${text(path)}`)
+      : effect.codeRefs.map(ref => `  - 코드 근거: ${text(ref.path)} / ${text(ref.quote)}`);
+    lines.push(`- ${text(effect.text)}`, '', ...evidence,
       `  - 확인 방법: ${text(effect.verification)}`, '');
   }
   return [...lines, '위 내용은 제공된 코드에서 추론한 영향이며, 실행으로 확인한 결과는 아닙니다. 검증 기록을 별도로 확인해야 합니다.', ''];
 }
-function featureLines(plan: PlanDraft, text: TextFormatter): string[] {
+function featureLines(plan: PlanDraft, text: TextFormatter, compact: boolean): string[] {
   const lines = ['## 기능 구현', ''];
-  for (const item of plan.items) {
-    lines.push(`### ${item.requirementIds.map(value => text(value)).join(', ')}`, '', text(item.proposedChanges), '',
-      `기존 동작: ${text(item.currentBehavior)}`, '', `변경 대상: ${item.affectedPaths.map(value => text(value)).join(', ')}`, '');
-    if (item.blockers.length) lines.push(`차단 사항: ${item.blockers.map(value => text(value)).join('; ')}`, '');
+  for (const [index, item] of plan.items.entries()) {
+    const indent = compact ? ' '.repeat(String(index + 1).length + 2) : '';
+    if (compact) lines.push(`${index + 1}. ${text(item.proposedChanges)}`, '');
+    else lines.push(`### ${item.requirementIds.map(value => text(value)).join(', ')}`, '', text(item.proposedChanges), '',
+      `기존 동작: ${text(item.currentBehavior)}`, '');
+    lines.push(`${indent}변경 대상: ${item.affectedPaths.map(value => text(value)).join(', ')}`, '');
+    if (item.blockers.length) lines.push(`${indent}차단 사항: ${item.blockers.map(value => text(value)).join('; ')}`, '');
   }
   return lines;
+}
+function pullRequestDetails(plan: PlanDraft, text: TextFormatter): string[] {
+  const lines = ['<details>', '<summary>변경 전 동작·추적 정보와 코드 근거</summary>', '', '### 기능 구현 상세', ''];
+  for (const [index, item] of plan.items.entries()) {
+    const indent = ' '.repeat(String(index + 1).length + 2);
+    lines.push(`${index + 1}. 요구사항: ${item.requirementIds.map(value => text(value)).join(', ')}`, '',
+      `${indent}기존 동작: ${text(item.currentBehavior)}`, '');
+  }
+  if (plan.sideEffects?.length) {
+    lines.push('### 사이드 이펙트 코드 근거', '');
+    for (const effect of plan.sideEffects) lines.push(`- ${text(effect.text)}`, '',
+      ...effect.codeRefs.map(ref => `  - ${text(ref.path)} / ${text(ref.quote)}`), '');
+  }
+  return [...lines, '</details>', ''];
 }
 const statusText: Record<VerificationResult['status'], string> = { passed: '통과', failed: '실패', not_run: '미실행', blocked: '실행 차단' };
 function verificationLines(plan: PlanDraft, checkpoint: ReportCheckpoint, text: TextFormatter): string[] {
@@ -69,12 +89,12 @@ function verificationLines(plan: PlanDraft, checkpoint: ReportCheckpoint, text: 
   lines.push('', '명령 통과 여부를 기록했습니다. 요구사항의 의미와 수동 확인 항목은 사람이 검토해야 합니다.', '');
   return lines;
 }
-function documentLines(input: ImplementationPresentation, text: TextFormatter, title: string): string[] {
+function documentLines(input: ImplementationPresentation, text: TextFormatter, title: string, compact = false): string[] {
   const { plan, checkpoint } = input;
   const summary = checkpoint.applied && checkpoint.changes ? checkpoint.changes.summary : plan.summary;
   return [`# ${text(title)}`, '', '## 요약', '', text(summary), '',
     checkpoint.commitSha ? '별도 브랜치에 변경을 커밋했습니다. 검토 후 병합할 수 있습니다.' : checkpoint.applied ? '파일 변경을 적용했습니다. 커밋과 게시 상태는 실행 기록을 확인하세요.' : '계획한 변경입니다. 아직 파일 변경을 완료하지 않았습니다.', '',
-    ...featureLines(plan, text), ...renderSideEffects(plan, text), ...verificationLines(plan, checkpoint, text)];
+    ...featureLines(plan, text, compact), ...renderSideEffects(plan, text, { includeQuotes: !compact }), ...verificationLines(plan, checkpoint, text)];
 }
 export function renderImplementationReport(input: ImplementationPresentation): string {
   const { checkpoint, plan, source, snapshot, runId } = input;
@@ -99,7 +119,8 @@ export function renderPullRequestTitle(input: ImplementationPresentation): strin
 export function renderPullRequestBody(input: ImplementationPresentation & { planId: string }): string {
   // Publish the approved functional narrative, even when it matches source wording.
   // Raw Slack message bodies, quote blocks and internal evidence links are never appended here.
-  const lines = documentLines(input, markdownText, renderPullRequestTitle(input));
+  const lines = documentLines(input, markdownText, renderPullRequestTitle(input), true);
+  lines.push(...pullRequestDetails(input.plan, markdownText));
   lines.push('## 검토 정보', '', `계획: ${markdownText(input.planId)}`, '',
     'Slack 원문과 내부 링크는 로컬 실행 보고서에서 확인할 수 있습니다. 이 PR은 검토용 초안입니다.', '',
     `slack-dev-run: ${input.runId}`, '');
