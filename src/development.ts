@@ -136,6 +136,9 @@ interface Checkpoint {
   changeHash?: string;
   applied?: boolean;
   verification?: VerificationResult[];
+  repairAttempts?: number;
+  /** Previous file state while a recorded correction is being applied. */
+  repairBase?: ChangeSet;
   commitSha?: string;
   prUrl?: string;
 }
@@ -151,7 +154,7 @@ function verificationPassed(results: VerificationResult[], config: ProjectConfig
       JSON.stringify(result.args) === JSON.stringify(command.args) && result.status === 'passed' && result.exitCode === 0 &&
       Number.isFinite(result.durationMs) && result.durationMs >= 0));
 }
-function assertFileState(worktree: string, context: RepositoryContext, changes: ChangeSet, applied: boolean) {
+function assertFileState(worktree: string, context: RepositoryContext, changes: ChangeSet, applied: boolean, repairBase?: ChangeSet) {
   for (const file of changes.files) {
     const path = join(worktree, file.path);
     // Never follow a symlink inserted into a parent directory between checkpoints.
@@ -160,7 +163,8 @@ function assertFileState(worktree: string, context: RepositoryContext, changes: 
     }
     if (existsSync(path) && (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink())) throw new Error('Changed file is not a regular file.');
     const actual = existsSync(path) ? readFileSync(path, 'utf8') : null;
-    const before = context.files.find(source => source.path === file.path)?.content ?? null;
+    const previous = repairBase?.files.find(source => source.path === file.path);
+    const before = previous ? previous.content : context.files.find(source => source.path === file.path)?.content ?? null;
     if (actual !== file.content && (applied || actual !== before)) throw new Error(`Worktree content changed outside the recorded patch: ${file.path}`);
   }
 }
@@ -227,41 +231,82 @@ export async function implementPlan(options: ImplementOptions) {
       writeArtifact(join(directory, 'usage.json'), implementer.usage ?? null);
       save(); store.finishStep(stepId, join(directory, 'changes.json')); stepId = undefined;
     }
-    const changes = validateChanges(checkpoint.changes, plan, context, config);
-    checkPlan(store, config, options.planId, true);
-    assertFileState(worktree.path, context, changes, checkpoint.applied ?? false);
-    if (!checkpoint.applied) {
-      stepId = store.startStep(runId, 'apply', hash(changes));
-      assertAllowedChanges(config, worktree.path, allowedPaths);
-      for (const file of changes.files) {
-        const target = join(worktree.path, file.path);
-        if (file.content === null) rmSync(target, { force: true });
-        else { mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, file.content, { mode: 0o644 }); }
-      }
-      const actual = assertAllowedChanges(config, worktree.path, allowedPaths);
-      if (actual.length === 0) throw new Error('The proposed change produced no diff.');
-      if (actual.some(path => !changes.files.some(file => file.path === path))) throw new Error('Worktree contains changes not present in the recorded patch.');
-      const diff = createDiff(worktree.path);
-      checkpoint.changeHash = hash(diff); checkpoint.applied = true;
-      writeArtifact(join(directory, 'patch.diff'), diff, true);
-      save(); store.finishStep(stepId, join(directory, 'patch.diff')); stepId = undefined;
-    }
-    if (!checkpoint.commitSha) {
-      if (hash(createDiff(worktree.path)) !== checkpoint.changeHash) throw new Error('Worktree diff differs from the recorded checkpoint. Refusing resume.');
-      store.status(runId, 'verifying');
-      stepId = store.startStep(runId, 'verify', checkpoint.changeHash!);
-      checkpoint.verification = await runner.run(worktree.path, development.commands, config);
-      writeArtifact(join(directory, 'verification.json'), checkpoint.verification);
-      save();
-      if (!verificationPassed(checkpoint.verification, config)) throw new Error('Changed-code verification did not pass. Diff and test results were preserved; no commit or PR was created.');
-      if (checkpoint.verification.some(result => result.imageId !== checkpoint.baseline?.find(before => before.commandId === result.commandId)?.imageId)) {
-        throw new Error('Verification image differs from the baseline. Use a pinned image and create a new plan.');
-      }
-      // Test commands execute in a copy; confirm their source never changed.
-      assertFileState(worktree.path, context, changes, true);
-      if (hash(createDiff(worktree.path)) !== checkpoint.changeHash) throw new Error('Worktree changed during verification.');
+    let changes = validateChanges(checkpoint.changes, plan, context, config);
+    const applyRecordedChanges = () => {
+      changes = validateChanges(checkpoint.changes, plan, context, config);
       checkPlan(store, config, options.planId, true);
-      store.finishStep(stepId, join(directory, 'verification.json')); stepId = undefined;
+      assertFileState(worktree.path, context, changes, checkpoint.applied ?? false, checkpoint.repairBase);
+      if (!checkpoint.applied) {
+        stepId = store.startStep(runId!, 'apply', hash(changes));
+        assertAllowedChanges(config, worktree.path, allowedPaths);
+        for (const file of changes.files) {
+          const target = join(worktree.path, file.path);
+          if (file.content === null) rmSync(target, { force: true });
+          else { mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, file.content, { mode: 0o644 }); }
+        }
+        const actual = assertAllowedChanges(config, worktree.path, allowedPaths);
+        if (actual.length === 0) throw new Error('The proposed change produced no diff.');
+        if (actual.some(path => !changes.files.some(file => file.path === path))) throw new Error('Worktree contains changes not present in the recorded patch.');
+        const diff = createDiff(worktree.path);
+        checkpoint.changeHash = hash(diff); checkpoint.applied = true;
+        delete checkpoint.repairBase;
+        writeArtifact(join(directory, 'patch.diff'), diff, true);
+        save(); store.finishStep(stepId, join(directory, 'patch.diff')); stepId = undefined;
+      }
+    };
+    applyRecordedChanges();
+    if (!checkpoint.commitSha) {
+      for (;;) {
+        if (hash(createDiff(worktree.path)) !== checkpoint.changeHash) throw new Error('Worktree diff differs from the recorded checkpoint. Refusing resume.');
+        store.status(runId, 'verifying');
+        stepId = store.startStep(runId, 'verify', checkpoint.changeHash!);
+        checkpoint.verification = await runner.run(worktree.path, development.commands, config);
+        writeArtifact(join(directory, 'verification.json'), checkpoint.verification);
+        writeArtifact(join(directory, `verification-attempt-${checkpoint.repairAttempts ?? 0}.json`), checkpoint.verification);
+        save();
+        if (checkpoint.verification.some(result => result.imageId !== checkpoint.baseline?.find(before => before.commandId === result.commandId)?.imageId)) {
+          throw new Error('Verification image differs from the baseline. Use a pinned image and create a new plan.');
+        }
+        // Test commands execute in a copy; confirm their source never changed.
+        assertFileState(worktree.path, context, changes, true);
+        if (hash(createDiff(worktree.path)) !== checkpoint.changeHash) throw new Error('Worktree changed during verification.');
+        checkPlan(store, config, options.planId, true);
+        if (!verificationPassed(checkpoint.verification, config)) {
+          const failure = 'Changed-code verification did not pass. Diff and test results were preserved; no commit or PR was created.';
+          // Only code/test failures can request a correction. Infrastructure failures need local attention.
+          const canRepair = implementer.repair && (checkpoint.repairAttempts ?? 0) < 2 &&
+            checkpoint.verification.length === development.commands.length &&
+            new Set(checkpoint.verification.map(result => result.commandId)).size === development.commands.length &&
+            checkpoint.verification.every(result => development.commands.some(command => command.id === result.commandId && command.program === result.program && JSON.stringify(command.args) === JSON.stringify(result.args)) &&
+              ['passed', 'failed', 'not_run'].includes(result.status) && (result.status !== 'failed' || (Number.isInteger(result.exitCode) && result.exitCode! > 0))) &&
+            checkpoint.verification.some(result => result.status === 'failed');
+          if (!canRepair) throw new Error(failure);
+          store.finishStep(stepId, join(directory, 'verification.json'), { message: failure }); stepId = undefined;
+          const attempt = (checkpoint.repairAttempts ?? 0) + 1;
+          writeArtifact(join(directory, `changes-before-repair-${attempt}.json`), changes);
+          writeArtifact(join(directory, `patch-before-repair-${attempt}.diff`), createDiff(worktree.path), true);
+          // Consume the bounded attempt before the paid call, including process interruption.
+          checkpoint.repairAttempts = attempt; save();
+          store.status(runId, 'implementing');
+          stepId = store.startStep(runId, 'repair', hash({ changes, verification: checkpoint.verification, attempt }));
+          const repaired = validateChanges(await implementer.repair!({ analysis, plan, context, config,
+            previousChanges: changes, verification: checkpoint.verification }), plan, context, config);
+          if (hash(repaired.files) === hash(changes.files)) throw new Error('Verification correction did not change any file.');
+          assertFileState(worktree.path, context, changes, true);
+          if (hash(createDiff(worktree.path)) !== checkpoint.changeHash) throw new Error('Worktree changed during correction.');
+          checkPlan(store, config, options.planId, true);
+          checkpoint.repairBase = changes; checkpoint.changes = repaired; checkpoint.applied = false;
+          delete checkpoint.verification;
+          writeArtifact(join(directory, `repair-${attempt}.json`), repaired);
+          writeArtifact(join(directory, `repair-${attempt}-usage.json`), implementer.usage ?? null);
+          writeArtifact(join(directory, 'changes.json'), repaired);
+          save(); store.finishStep(stepId, join(directory, `repair-${attempt}.json`)); stepId = undefined;
+          applyRecordedChanges();
+          continue;
+        }
+        store.finishStep(stepId, join(directory, 'verification.json')); stepId = undefined;
+        break;
+      }
       stepId = store.startStep(runId, 'commit', checkpoint.changeHash!);
       checkpoint.commitSha = commitChanges(worktree.path, `Implement reviewed Slack plan ${options.planId}`);
       save(); store.finishStep(stepId); stepId = undefined;

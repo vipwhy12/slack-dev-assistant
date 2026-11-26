@@ -15,7 +15,7 @@ import { RunStore } from './store.js';
 import { checkConnection, collectSnapshot } from './connection.js';
 import { planRun, approvePlan, implementPlan } from './development.js';
 import { FilePlanner, OpenAIPlanner } from './planning.js';
-import { FileImplementer, OpenAIImplementer, BudgetLedger } from './generation.js';
+import { FileImplementer, OpenAIImplementer, BudgetLedger, IMPLEMENTATION_PROMPT_VERSION } from './generation.js';
 
 const program = new Command().name('slack-dev').version('0.2.0')
   .description('Analyze Slack discussions into evidence-linked requirement drafts.');
@@ -124,15 +124,16 @@ program.command('implement').argument('<plan-id>').addOption(configOption())
   .requiredOption('--grant <id>', 'execution grant returned by approve-plan')
   .option('--changes-file <path>', 'replay validated full-file changes without an LLM call')
   .option('--publish', 'push the verified branch and create/reuse a draft PR; grant must allow PRs')
-  .option('--resume <run-id>', 'resume the recorded patch/verification/publication without regenerating changes')
+  .option('--resume <run-id>', 'resume saved verification/publication, including bounded corrections for code failures')
   .action(async (planId: string, options: {config: string; grant: string; changesFile?: string; publish?: boolean; resume?: string}) => {
     const config = loadConfig(options.config);
     // Instantiate the network adapter lazily: a completed checkpoint can resume without a key.
     let delegate: OpenAIImplementer | undefined;
     const implementer = options.changesFile ? new FileImplementer(options.changesFile) : {
-      name: 'openai', model: config.model, promptVersion: 'implementation-v1',
+      name: 'openai', model: config.model, promptVersion: IMPLEMENTATION_PROMPT_VERSION,
       get usage() { return delegate?.usage; },
       async implement(input: Parameters<OpenAIImplementer['implement']>[0]) { delegate = new OpenAIImplementer(config); return delegate.implement(input); },
+      async repair(input: Parameters<OpenAIImplementer['repair']>[0]) { delegate ??= new OpenAIImplementer(config); return delegate.repair(input); },
     };
     json(await implementPlan({ config, planId, grantId: options.grant, implementer, publish: options.publish, resumeRunId: options.resume }));
   });

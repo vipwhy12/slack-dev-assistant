@@ -2,12 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import { SocketModeClient } from '@slack/socket-mode';
+import { LogLevel } from '@slack/web-api';
 import { configSchema } from '../src/config.js';
 import { SlackJobStore } from '../src/slack-jobs.js';
 import { SlackService, type SlackAnalysis, type SlackPlan, type SlackWorkflowBackend } from '../src/slack-service.js';
-import { SlackSocketController, type SlackTransport } from '../src/slack-runtime.js';
+import { SlackSocketConnection, SlackSocketController, type SlackTransport } from '../src/slack-runtime.js';
 
 const resources: Array<{ store: SlackJobStore; directory: string; controller: SlackSocketController }> = [];
+const connections: SlackSocketConnection[] = [];
 const thread = 'https://team.slack.com/archives/C1/p1795086841177069';
 const commandBody = (text = `analyze ${thread}`) => ({ team_id: 'T1', api_app_id: 'A1', user_id: 'U1', channel_id: 'C1', command: '/duduk', text });
 const interactiveIdentity = { team: { id: 'T1' }, api_app_id: 'A1', user: { id: 'U1' } };
@@ -32,7 +36,9 @@ function setup(blocking = false) {
   return { service, store, backend, transport, log, controller, analysis, plan };
 }
 afterEach(async () => {
+  for (const connection of connections.splice(0)) await connection.stop();
   for (const resource of resources.splice(0)) { await resource.controller.stop(); resource.store.close(); rmSync(resource.directory, { recursive: true, force: true }); }
+  vi.useRealTimers(); vi.restoreAllMocks();
 });
 async function analyze(fixture: ReturnType<typeof setup>) {
   const ack = vi.fn(async (_payload?: object) => {});
@@ -191,5 +197,103 @@ describe('proposal Socket Mode interaction', () => {
     await fixture.controller.idle();
     expect(JSON.stringify(ack.mock.calls)).toContain('sd_proposal_yes'); expect(JSON.stringify(ack.mock.calls)).toContain('sd_proposal_no');
     expect(fixture.backend.prepareProposal).toHaveBeenCalledTimes(2); expect(fixture.backend.approveProposal).not.toHaveBeenCalled();
+  });
+});
+
+class FakeSocket extends EventEmitter {
+  start = vi.fn(async () => { this.emit('connected'); });
+  disconnect = vi.fn(async () => { this.emit('disconnected'); });
+}
+function managedSocket(socket = new FakeSocket()) {
+  const log = vi.fn(), connection = new SlackSocketConnection(socket, log, { baseDelayMs: 100, maxDelayMs: 200, maxAttempts: 3 });
+  connections.push(connection);
+  return { socket, connection, log };
+}
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe('Socket Mode reconnect ownership without network access', () => {
+  it('catches DNS reconnect failures once and preserves the in-flight durable worker job', async () => {
+    vi.useFakeTimers();
+    const fixture = setup(), work = deferred(), { socket, connection, log } = managedSocket();
+    fixture.backend.analyze.mockImplementation(async () => { await work.promise; return structuredClone(fixture.analysis); });
+    await connection.start();
+    socket.start.mockRejectedValueOnce(Object.assign(new Error('getaddrinfo ENOTFOUND slack.com'), { code: 'ENOTFOUND' }));
+    await fixture.controller.command({ body: commandBody(), envelope_id: 'in-flight', ack: async () => {} });
+    socket.emit('disconnected'); socket.emit('disconnected'); socket.emit('disconnected');
+    await vi.advanceTimersByTimeAsync(100);
+    work.resolve(); await fixture.controller.idle();
+    expect(socket.start).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('reconnect failed (1/3)'));
+    expect(fixture.backend.analyze).toHaveBeenCalledTimes(1);
+    expect(fixture.transport.message).toHaveBeenCalledWith('C1', '1795086841.177069', expect.objectContaining({ text: expect.stringContaining('awaiting_review') }));
+    await vi.advanceTimersByTimeAsync(200); await connection.idle();
+    expect(socket.start).toHaveBeenCalledTimes(3);
+    expect(log).toHaveBeenCalledWith('Socket Mode connection restored.');
+    expect(fixture.backend.analyze).toHaveBeenCalledTimes(1);
+  });
+  it('caps reconnect attempts and leaves the worker process available after repeated failures', async () => {
+    vi.useFakeTimers(); const { socket, connection, log } = managedSocket();
+    await connection.start(); socket.start.mockRejectedValue(new Error('ENOTFOUND slack.com'));
+    socket.emit('disconnected'); await vi.advanceTimersByTimeAsync(500); await connection.idle();
+    expect(socket.start).toHaveBeenCalledTimes(4);
+    expect(log).toHaveBeenLastCalledWith(expect.stringContaining('Local jobs continue'));
+    socket.emit('disconnected'); await vi.advanceTimersByTimeAsync(10_000);
+    expect(socket.start).toHaveBeenCalledTimes(4);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('does not start another connection if a connected event arrives during the retry delay', async () => {
+    vi.useFakeTimers(); const { socket, connection } = managedSocket();
+    await connection.start(); socket.emit('disconnected'); socket.emit('connected');
+    await vi.advanceTimersByTimeAsync(100); await connection.idle();
+    expect(socket.start).toHaveBeenCalledTimes(1);
+  });
+  it('cancels pending backoff and unregisters its own listeners on idempotent stop', async () => {
+    vi.useFakeTimers(); const { socket, connection } = managedSocket();
+    await connection.start(); socket.emit('disconnected');
+    const first = connection.stop(); expect(connection.stop()).toBe(first); await first;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(socket.start).toHaveBeenCalledTimes(1); expect(socket.disconnect).toHaveBeenCalledTimes(1);
+    expect(socket.listenerCount('connected')).toBe(0); expect(socket.listenerCount('disconnected')).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('closes a reconnect that succeeds after stop and waits for its cleanup', async () => {
+    vi.useFakeTimers(); const { socket, connection } = managedSocket(), opening = deferred();
+    await connection.start(); socket.start.mockImplementationOnce(async () => { await opening.promise; socket.emit('connected'); });
+    socket.emit('disconnected'); await vi.advanceTimersByTimeAsync(100);
+    let stopped = false; const stopping = connection.stop().then(() => { stopped = true; });
+    await Promise.resolve(); expect(stopped).toBe(false);
+    opening.resolve(); await stopping;
+    expect(stopped).toBe(true); expect(socket.start).toHaveBeenCalledTimes(2); expect(socket.disconnect).toHaveBeenCalledTimes(2);
+    expect(socket.listenerCount('connected')).toBe(0); expect(vi.getTimerCount()).toBe(0);
+  });
+  it('propagates initial connection failure and does not schedule a background reconnect', async () => {
+    vi.useFakeTimers(); const { socket, connection } = managedSocket();
+    socket.start.mockRejectedValueOnce(new Error('initial DNS failure'));
+    await expect(connection.start()).rejects.toThrow('initial DNS failure');
+    socket.emit('disconnected'); await vi.advanceTimersByTimeAsync(10_000);
+    expect(socket.start).toHaveBeenCalledTimes(1);
+  });
+  it('handles the installed SDK close and refresh paths with its automatic reconnect disabled', async () => {
+    vi.useFakeTimers();
+    const network = vi.fn(async () => { throw new Error('Unexpected network request'); });
+    const socket = new SocketModeClient({ appToken: 'xapp-offline-test', autoReconnectEnabled: false,
+      logLevel: LogLevel.ERROR, clientOptions: { fetch: network, retryConfig: { retries: 0 } } });
+    const start = vi.spyOn(socket, 'start').mockImplementation(async () => { socket.emit('connected'); return { ok: true }; });
+    vi.spyOn(socket, 'disconnect').mockImplementation(async () => { socket.emit('disconnected'); });
+    const websocket = { disconnect: () => { socket.emit('close', websocket); } };
+    Object.defineProperty(socket, 'websocket', { value: websocket, writable: true });
+    const log = vi.fn(), connection = new SlackSocketConnection(socket, log, { baseDelayMs: 100, maxDelayMs: 200, maxAttempts: 3 });
+    connections.push(connection); await connection.start();
+    start.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND slack.com'));
+    socket.emit('close', websocket); await vi.advanceTimersByTimeAsync(100);
+    expect(start).toHaveBeenCalledTimes(2); expect(log).toHaveBeenCalledWith(expect.stringContaining('reconnect failed'));
+    await vi.advanceTimersByTimeAsync(200); await connection.idle(); expect(start).toHaveBeenCalledTimes(3);
+    socket.emit('ws_message', JSON.stringify({ type: 'disconnect', reason: 'refresh_requested' }), false, websocket);
+    await vi.advanceTimersByTimeAsync(100); await connection.idle(); expect(start).toHaveBeenCalledTimes(4);
+    expect(network).not.toHaveBeenCalled();
   });
 });

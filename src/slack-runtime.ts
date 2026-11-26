@@ -103,6 +103,79 @@ export class SlackSocketController {
   async stop(): Promise<void> { this.stopped = true; await this.idle(); }
 }
 
+interface ManagedSocket {
+  start(): Promise<unknown>;
+  disconnect(): Promise<void>;
+  on(event: 'connected' | 'disconnected', listener: () => void): unknown;
+  removeListener(event: 'connected' | 'disconnected', listener: () => void): unknown;
+}
+
+/** Own every reconnect promise: SDK 3.2 async event listeners can otherwise reject unhandled. */
+export class SlackSocketConnection {
+  private started = false;
+  private stopped = false;
+  private connected = false;
+  private exhausted = false;
+  private reconnecting?: Promise<void>;
+  private stopping?: Promise<void>;
+  private waiting?: { timer: ReturnType<typeof setTimeout>; finish(): void };
+  private readonly onConnected = () => { this.connected = true; this.exhausted = false; };
+  private readonly onDisconnected = () => { this.connected = false; this.reconnect(); };
+  constructor(private readonly socket: ManagedSocket,
+    private readonly log: (message: string) => void = message => process.stderr.write(`${message}\n`),
+    private readonly options: { maxAttempts?: number; baseDelayMs?: number; maxDelayMs?: number } = {}) {
+    socket.on('connected', this.onConnected); socket.on('disconnected', this.onDisconnected);
+  }
+  async start(): Promise<void> {
+    await this.socket.start();
+    if (this.stopped) { await this.socket.disconnect(); throw new Error('Socket Mode connection is stopped.'); }
+    this.started = true;
+    if (!this.connected) this.reconnect();
+  }
+  private reconnect(): void {
+    if (!this.started || this.stopped || this.exhausted || this.reconnecting) return;
+    this.reconnecting = this.retryConnection().catch(error => {
+      this.exhausted = true;
+      this.log(`Socket Mode reconnect stopped: ${safeError(error).message}`);
+    }).finally(() => { this.reconnecting = undefined; if (!this.connected) this.reconnect(); });
+  }
+  private async retryConnection(): Promise<void> {
+    const maxAttempts = this.options.maxAttempts ?? 6;
+    for (let attempt = 1; attempt <= maxAttempts && !this.stopped; attempt++) {
+      const delay = Math.min((this.options.baseDelayMs ?? 1000) * 2 ** (attempt - 1), this.options.maxDelayMs ?? 30_000);
+      await new Promise<void>(resolve => {
+        const finish = () => { this.waiting = undefined; resolve(); };
+        this.waiting = { timer: setTimeout(finish, delay), finish };
+      });
+      if (this.stopped || this.connected) return;
+      try {
+        await this.socket.start();
+        if (this.stopped) { await this.socket.disconnect(); return; }
+        if (this.connected) { this.log('Socket Mode connection restored.'); return; }
+      } catch (error) {
+        if (this.stopped) return;
+        this.log(`Socket Mode reconnect failed (${attempt}/${maxAttempts}): ${safeError(error).message}`);
+      }
+    }
+    if (!this.stopped) {
+      this.exhausted = true;
+      this.log('Socket Mode reconnect limit reached. Local jobs continue; restart the worker after they finish to reconnect.');
+    }
+  }
+  async idle(): Promise<void> { await this.reconnecting; }
+  stop(): Promise<void> {
+    this.stopping ??= (async () => {
+      this.stopped = true;
+      this.socket.removeListener('connected', this.onConnected); this.socket.removeListener('disconnected', this.onDisconnected);
+      if (this.waiting) { clearTimeout(this.waiting.timer); this.waiting.finish(); }
+      try { await this.socket.disconnect(); }
+      catch (error) { this.log(`Socket Mode disconnect failed: ${safeError(error).message}`); }
+      await this.idle();
+    })();
+    return this.stopping;
+  }
+}
+
 export async function serveSlack(config: ProjectConfig): Promise<{ stop(): Promise<void> }> {
   if (!config.slackApp) throw new Error('slackApp configuration is required. See docs/slack-commands.md.');
   const readToken = process.env.SLACK_TOKEN, botToken = process.env.SLACK_BOT_TOKEN, appToken = process.env.SLACK_APP_TOKEN;
@@ -132,18 +205,20 @@ export async function serveSlack(config: ProjectConfig): Promise<{ stop(): Promi
     },
     async modal(triggerId, view) { await client.views.open({ trigger_id: triggerId, view: view as unknown as ViewsOpenArguments['view'] }); },
   });
-  const socket = new SocketModeClient({ appToken, logger, logLevel: LogLevel.ERROR,
+  // Disable both SDK close-event and server-refresh automatic reconnect promises.
+  const socket = new SocketModeClient({ appToken, logger, logLevel: LogLevel.ERROR, autoReconnectEnabled: false,
     clientOptions: { retryConfig: { retries: 0 }, timeout: 15_000 } });
   const logError = (error: unknown) => process.stderr.write(`Slack: ${safeError(error).message}\n`);
   socket.on('slash_commands', (event: SocketEnvelope) => { void controller.command(event).catch(logError); });
   socket.on('interactive', (event: SocketEnvelope) => { void controller.interactive(event).catch(logError); });
   socket.on('error', logError);
-  try { await socket.start(); } catch (error) { await socket.disconnect(); store.close(); throw new Error(`Socket Mode connection failed: ${safeError(error).message}`); }
+  const connection = new SlackSocketConnection(socket);
+  try { await connection.start(); } catch (error) { await connection.stop(); store.close(); throw new Error(`Socket Mode connection failed: ${safeError(error).message}`); }
   controller.kick();
   const interval = setInterval(() => controller.kick(), 1000);
   let stopping: Promise<void> | undefined;
   return { stop() {
-    stopping ??= (async () => { clearInterval(interval); await socket.disconnect(); await controller.stop(); store.close(); })();
+    stopping ??= (async () => { clearInterval(interval); await connection.stop(); await controller.stop(); store.close(); })();
     return stopping;
   } };
 }
