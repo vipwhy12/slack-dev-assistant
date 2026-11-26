@@ -30,7 +30,8 @@ function plan(): PlanDraft {
 }
 function wirePlan(): ReturnType<typeof generatedPlanWireSchema.parse> {
   const stored = plan();
-  return { ...stored, title: '기능 활성화', sideEffects: [], items: stored.items.map(item => ({ ...item,
+  return { ...stored, title: '기능 활성화', sideEffects: [{ text: '현재 false인 enabled 값을 true로 바꾸면 외부에 제공하는 활성 상태가 바뀐다.',
+    codeRefs: [{ path: 'src/app.ts', startLine: 1, endLine: 1 }], verification: 'enabled가 true인지 테스트하고 실제 사용처의 분기 동작은 별도로 확인한다.' }], items: stored.items.map(item => ({ ...item,
     codeRefs: [{ path: 'src/app.ts', startLine: 1, endLine: 1 }] })) };
 }
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -136,7 +137,8 @@ describe('planner adapters and report', () => {
     await expect(second.plan(input)).resolves.toEqual(changed);
   });
   it('uses structured output and sends scoped repository data without local paths or credentials', async () => {
-    const generated = { ...plan(), title: '기능 활성화', sideEffects: [] };
+    const generated = { ...plan(), title: '기능 활성화', sideEffects: wirePlan().sideEffects.map(effect => ({ ...effect,
+      codeRefs: [{ path: 'src/app.ts', quote: 'export const enabled = false;' }] })) };
     generated.items[0]!.codeRefs[0]!.quote = 'export const enabled = false;';
     const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: wirePlan(), output: [] });
     const c = config(); const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
@@ -146,6 +148,7 @@ describe('planner adapters and report', () => {
     expect(request.instructions).toContain('Use Korean');
     expect(request.instructions).toContain('Do not invent generic risks');
     expect(request.instructions).toContain('sideEffects');
+    expect(request.instructions).toContain('sideEffects must contain at least one concrete code-grounded impact');
     expect(request.instructions).toContain('short Korean noun phrase');
     expect(request.instructions).toContain('inclusive one-based startLine/endLine');
     expect(request.instructions).toContain('Every file listed in affectedPaths must actually change during implementation');
@@ -153,6 +156,7 @@ describe('planner adapters and report', () => {
     expect(request).toMatchObject({ store: false, max_output_tokens: 8192, text: { format: { strict: true } } });
     expect(request.text.format).toMatchObject({ schema: { required: expect.arrayContaining(['title', 'sideEffects']) } });
     expect(request.text.format).toMatchObject({ schema: { properties: { title: { pattern: '\\S', minLength: 1, maxLength: 80 } } } });
+    expect(request.text.format).toMatchObject({ schema: { properties: { sideEffects: { minItems: 1 } } } });
     expect(request.input).not.toContain(context.repoPath);
     expect(request.input).not.toContain(c.storageDir);
     expect(JSON.parse(request.input).commands).toEqual([{ id: 'test' }]);
@@ -162,7 +166,7 @@ describe('planner adapters and report', () => {
     expect(request.text.format).toMatchObject({ schema: { properties: { items: { items: { properties: {
       codeRefs: { items: { required: ['path', 'startLine', 'endLine'], additionalProperties: false } },
     } } } } } });
-    expect(planner.promptVersion).toBe('planning-v7');
+    expect(planner.promptVersion).toBe('planning-v8');
     expect(parse).toHaveBeenCalledTimes(1);
   });
   it('escapes untrusted markup in human-readable plans', () => {
@@ -173,6 +177,14 @@ describe('planner adapters and report', () => {
     expect(rendered).toContain('## 사이드 이펙트\n\n');
     expect(rendered).not.toContain('<script>'); expect(rendered).not.toContain('https://evil.test');
     expect(rendered).toContain('A1 → test');
+  });
+  it('rejects an empty provider impact analysis while preserving stored-plan compatibility', async () => {
+    expect(generatedPlanSchema.parse({ ...plan(), title: '기능 활성화', sideEffects: [] }).sideEffects).toEqual([]);
+    const c = config(); const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({
+      status: 'completed', output_parsed: { ...wirePlan(), sideEffects: [] }, output: [],
+    });
+    await expect(new OpenAIPlanner(c, { client: { responses: { parse } } }).plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).rejects.toThrow();
+    expect(parse).toHaveBeenCalledTimes(1);
   });
   it('uses the short title for the heading while retaining the full summary', () => {
     const p = plan(); p.title = '거래 내역 필터 색상 변경'; p.summary = '거래 내역의 선택한 필터에 배경색을 적용하고 다른 필터로 바꾸면 이전 선택 표시를 지웁니다.';
