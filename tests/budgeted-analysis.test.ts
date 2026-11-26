@@ -65,6 +65,7 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     expect(request.instructions).toContain('never an approval or authoritative requirement');
     expect(request.instructions).toContain('Every sourceRef must select numbered lines from a message in the current snapshot');
     expect(JSON.parse(request.input).messages[0].lines).toEqual([{ number: 1, text: '버튼을 추가한다.' }]);
+    expect(JSON.parse(request.input).messages[0].lineCount).toBe(1);
     expect(JSON.parse(request.input).messages[0]).not.toHaveProperty('text');
     expect(request.text.format).toMatchObject({ schema: { properties: { requirements: { items: { properties: {
       sourceRefs: { items: { required: ['messageVersionId', 'startLine', 'endLine'], additionalProperties: false } },
@@ -163,11 +164,11 @@ describe('one bounded correction for source ranges and analysis relationships', 
     const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
     await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
     expect(fake.parse).toHaveBeenCalledTimes(2);
-    expect(analyzer.promptVersion).toContain('budgeted-v7');
+    expect(analyzer.promptVersion).toContain('budgeted-v8');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     const {correction,...source} = second;
     expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
-    expect(correction.validationError).toContain('Evidence line range is invalid');
+    expect(correction.validationError).toBe('Evidence line range is invalid: current-message; requested 1..2; valid 1..1, with startLine <= endLine');
     expect(fake.parse.mock.calls[1]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'slack_requirements_repair'}}});
     expect(fake.parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
     expect(fake.parse.mock.calls[1]![0].instructions).toContain('untrusted diagnostic data');
@@ -250,6 +251,34 @@ describe('latest feedback restrictions remain source requirements', () => {
 });
 
 describe('numbered Slack source materialization', () => {
+  it('resets bounds per message and corrects visually wrapped single-line evidence without changing the source', async () => {
+    const longText = '버튼을 추가하고 기존 동작은 유지해 주세요. '.repeat(20);
+    const source = snapshot();
+    source.messages = ['앞선 논의\n\n첫 항목\n둘째 항목\n\n셋째 항목', '답글\n내용\n마지막', '다른 답글\n\n확인', longText].map((text, index) => ({
+      ...source.messages[0]!, id: `message-${index}`, ts: `179504640${index}.000001`, text,
+      permalink: `https://example.slack.com/archives/CONE/p179504640${index}000001`,
+    }));
+    source.contentHash = snapshotContentHash(source);
+    const invalid = wireDraft(); invalid.requirements[0]!.sourceRefs = [{ messageVersionId: 'message-3', startLine: 13, endLine: 15 }];
+    const corrected = structuredClone(invalid); corrected.requirements[0]!.sourceRefs[0]!.startLine = 1; corrected.requirements[0]!.sourceRefs[0]!.endLine = 1;
+    const fake = client(); fake.parse.mockReset()
+      .mockResolvedValueOnce({ status: 'completed', output_parsed: invalid, output: [] })
+      .mockResolvedValueOnce({ status: 'completed', output_parsed: corrected, output: [] });
+    const result = await new BudgetedAnalyzer(config, url, { client: fake.client }).analyze(source);
+    expect(result.requirements[0]!.sourceRefs).toEqual([{ messageVersionId: 'message-3', quote: longText }]);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
+    expect(first.messages.map((message: { lineCount: number }) => message.lineCount)).toEqual([6, 3, 3, 1]);
+    expect(first.messages.every((message: { lines: Array<{ number: number }> }) => message.lines[0]!.number === 1)).toBe(true);
+    expect(first.messages[3].lines).toEqual([{ number: 1, text: longText }]);
+    expect(second.messages).toEqual(first.messages);
+    expect(second.correction.validationError).toBe('Evidence line range is invalid: message-3; requested 13..15; valid 1..1, with startLine <= endLine');
+    expect(fake.parse.mock.calls[0]![0].instructions).toContain('Line numbers restart at 1 for every message');
+    expect(fake.parse.mock.calls[0]![0].instructions).toContain('Only literal LF characters separate source lines');
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('visual wrapping never adds source lines');
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('If lineCount=1, both bounds must be 1');
+    expect(source.messages[3]!.text).toBe(longText);
+  });
   it.each(['\n', '\r\n'])('materializes requirement, criterion and question references without changing %j source text', async ending => {
     const text = ['첫 줄', '\t버튼을 추가한다.', '가 표시는 어떻게 할까요?', ''].join(ending);
     const source = snapshot('CONE', text); const wire = wireDraft();
@@ -263,6 +292,7 @@ describe('numbered Slack source materialization', () => {
     expect(result.questions[0]!.sourceRefs).toEqual([{ messageVersionId: 'current-message', quote: '가 표시는 어떻게 할까요?' + ending }]);
     expect(JSON.stringify(result)).not.toContain('startLine'); expect(JSON.stringify(result)).not.toContain('endLine');
     expect(JSON.parse(fake.parse.mock.calls[0]![0].input).messages[0].lines[1]).toEqual({ number: 2, text: '\t버튼을 추가한다.' + cr });
+    expect(JSON.parse(fake.parse.mock.calls[0]![0].input).messages[0].lineCount).toBe(4);
     expect(source.messages[0]!.text).toBe(text); expect(fake.parse).toHaveBeenCalledTimes(1);
   });
   it.each([
