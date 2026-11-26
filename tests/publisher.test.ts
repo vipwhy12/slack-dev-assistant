@@ -24,6 +24,7 @@ function fixtureExecutor(existing: unknown[] = []) {
   const calls: { program: string; args: string[]; env: NodeJS.ProcessEnv }[] = [];
   const executor: PublisherExecutor = async (program, args, _cwd, env) => {
     calls.push({ program, args, env });
+    if (program === 'git' && args.includes('ls-remote') && args.at(-1) === 'refs/heads/main') return `${getRepoCommit(config)}\trefs/heads/main\n`;
     if (program === 'gh' && args[0] === 'repo') return 'example/repository\n';
     if (program === 'gh' && args[1] === 'list') return JSON.stringify(existing);
     if (program === 'gh' && args[1] === 'create') return 'https://github.com/example/repository/pull/7\n';
@@ -62,9 +63,24 @@ describe('reviewable draft publishing', () => {
   });
   it('rejects divergent remote branch identity without pushing', async () => {
     const mock = fixtureExecutor();
-    const executor: PublisherExecutor = (program, args, cwd, env) => args.includes('ls-remote')
+    const executor: PublisherExecutor = (program, args, cwd, env) => args.includes('ls-remote') && args.at(-1) !== 'refs/heads/main'
       ? Promise.resolve(`${'f'.repeat(40)}\trefs/heads/${worktree.branch}\n`) : mock.executor(program, args, cwd, env);
     await expect(publishDraft(config, worktree.path, worktree.branch, bodyFile, 'Fixture', executor)).rejects.toThrow(/unrelated changes/);
     expect(mock.calls.some((call) => call.args.includes('push'))).toBe(false);
   });
+  it('rejects a target checkout containing commits outside the remote PR base before pushing', async () => {
+    const mock = fixtureExecutor();
+    const executor: PublisherExecutor = (program, args, cwd, env) => args.includes('ls-remote') && args.at(-1) === 'refs/heads/main'
+      ? Promise.resolve(`${'a'.repeat(40)}\trefs/heads/main\n`) : mock.executor(program, args, cwd, env);
+    await expect(publishDraft(config, worktree.path, worktree.branch, bodyFile, 'Fixture', executor)).rejects.toThrow('PR base does not match');
+    expect(mock.calls.some(call => call.args.includes('push') || call.args.includes('create'))).toBe(false);
+  });
+  it('checks all committed PR files, not only the uncommitted working tree', async () => {
+    writeFileSync(join(worktree.path, 'unapproved.md'), 'unapproved');
+    git(worktree.path, ['add', 'unapproved.md']); git(worktree.path, ['commit', '-m', 'Outside scope']);
+    const mock = fixtureExecutor();
+    await expect(publishDraft(config, worktree.path, worktree.branch, bodyFile, 'Fixture', mock.executor)).rejects.toThrow('complete PR diff');
+    expect(mock.calls.some(call => call.args.includes('push'))).toBe(false);
+  });
+
 });

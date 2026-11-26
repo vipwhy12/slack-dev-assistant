@@ -3,8 +3,8 @@ import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-export type SlackJobKind = 'save' | 'analyze' | 'plan' | 'implement';
-export type SlackJobStatus = 'queued' | 'running' | 'awaiting_review' | 'awaiting_approval' | 'completed' | 'failed' | 'needs_resume';
+export type SlackJobKind = 'save' | 'analyze' | 'plan' | 'feedback' | 'implement';
+export type SlackJobStatus = 'queued' | 'running' | 'awaiting_review' | 'awaiting_approval' | 'awaiting_feedback' | 'completed' | 'failed' | 'needs_resume';
 export interface SlackJob {
   id: string; projectId: string; scopeHash: string; envelopeId: string;
   teamId: string; appId: string; channelId: string; userId: string;
@@ -12,7 +12,7 @@ export interface SlackJob {
   createdAt: string; updatedAt: string; input: unknown; result: unknown; error: string | null;
 }
 export interface SlackAction {
-  nonce: string; jobId: string; kind: 'review' | 'implement'; binding: string;
+  nonce: string; jobId: string; kind: 'review' | 'implement' | 'proposal' | 'feedback'; binding: string;
   createdAt: string; consumedAt: string | null;
 }
 type NewJob = Pick<SlackJob, 'scopeHash' | 'envelopeId' | 'teamId' | 'appId' | 'channelId' | 'userId' | 'threadUrl' | 'threadTs'> & { kind: 'save' | 'analyze' };
@@ -45,7 +45,10 @@ export class SlackJobStore {
         binding TEXT NOT NULL, createdAt TEXT NOT NULL, consumedAt TEXT);
       CREATE TABLE IF NOT EXISTS slack_worker_lock (
         projectId TEXT PRIMARY KEY, owner TEXT NOT NULL, pid INTEGER NOT NULL);
-      PRAGMA user_version=1;`);
+      CREATE TABLE IF NOT EXISTS slack_feedback_requests (
+        projectId TEXT NOT NULL, id TEXT NOT NULL, jobId TEXT NOT NULL REFERENCES slack_jobs(id),
+        inputJson TEXT NOT NULL, createdAt TEXT NOT NULL, PRIMARY KEY(projectId,id));
+      PRAGMA user_version=2;`);
   }
   enqueue(input: NewJob): { job: SlackJob; reused: boolean } {
     this.db.exec('BEGIN IMMEDIATE');
@@ -127,6 +130,7 @@ export class SlackJobStore {
       const lock = this.db.prepare('SELECT owner FROM slack_worker_lock WHERE projectId=?').get(this.projectId) as { owner: string } | undefined;
       if (job.status !== 'running' || !this.workerOwner || lock?.owner !== this.workerOwner) throw new Error('Only the claiming worker may finish a running job.');
       this.db.prepare('UPDATE slack_jobs SET status=?,resultJson=?,error=?,updatedAt=? WHERE id=?').run(status, JSON.stringify(result), error, now(), id);
+      this.db.prepare('UPDATE slack_actions SET consumedAt=? WHERE jobId=? AND consumedAt IS NULL').run(now(), id);
       let created: SlackAction | undefined;
       if (action) {
         created = { nonce: randomUUID(), jobId: id, ...action, createdAt: now(), consumedAt: null };
@@ -142,11 +146,50 @@ export class SlackJobStore {
     try {
       const action = this.action(nonce), job = this.get(action.jobId);
       const expected = action.kind === 'review' ? 'awaiting_review' : 'awaiting_approval';
-      if (action.consumedAt || action.binding !== binding || job.status !== expected) throw new Error('Approval is stale or has already been used.');
-      this.db.prepare('UPDATE slack_actions SET consumedAt=? WHERE nonce=?').run(now(), nonce);
+      if (action.kind === 'feedback' || action.consumedAt || action.binding !== binding || job.status !== expected) throw new Error('Approval is stale or has already been used.');
+      this.db.prepare('UPDATE slack_actions SET consumedAt=? WHERE jobId=? AND consumedAt IS NULL').run(now(), job.id);
       this.db.prepare("UPDATE slack_jobs SET kind=?,status='queued',inputJson=?,updatedAt=? WHERE id=?")
         .run(action.kind === 'review' ? 'plan' : 'implement', JSON.stringify({ ...Object(input), command: (job.input as { command: string }).command }), now(), job.id);
       this.db.exec('COMMIT'); return this.get(job.id);
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  /** N invalidates Y immediately, even when the user later cancels the feedback modal. */
+  beginFeedback(nonce: string, binding: string): SlackAction {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const action = this.action(nonce), job = this.get(action.jobId);
+      if (action.kind !== 'proposal' || action.consumedAt || action.binding !== binding || job.status !== 'awaiting_approval') throw new Error('Proposal is stale or has already been used.');
+      const time = now();
+      this.db.prepare('UPDATE slack_actions SET consumedAt=? WHERE jobId=? AND consumedAt IS NULL').run(time, job.id);
+      this.db.prepare("UPDATE slack_jobs SET status='awaiting_feedback',updatedAt=? WHERE id=?").run(time, job.id);
+      const feedback: SlackAction = { nonce: randomUUID(), jobId: job.id, kind: 'feedback', binding, createdAt: time, consumedAt: null };
+      this.db.prepare('INSERT INTO slack_actions VALUES(?,?,?,?,?,NULL)').run(feedback.nonce, job.id, feedback.kind, binding, time);
+      this.db.exec('COMMIT'); return feedback;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  feedbackRequest(id: string): { jobId: string; input: unknown } | undefined {
+    const row = this.db.prepare('SELECT jobId,inputJson FROM slack_feedback_requests WHERE projectId=? AND id=?')
+      .get(this.projectId, id) as { jobId: string; inputJson: string } | undefined;
+    return row ? { jobId: row.jobId, input: JSON.parse(row.inputJson) } : undefined;
+  }
+  /** Feedback, nonce invalidation and delivery deduplication commit together. */
+  queueFeedback(nonce: string, binding: string, requestId: string, input: unknown): { job: SlackJob; reused: boolean } {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const action = this.action(nonce), job = this.get(action.jobId), serialized = JSON.stringify(input);
+      const existing = this.feedbackRequest(requestId);
+      if (existing) {
+        if (existing.jobId !== job.id || JSON.stringify(existing.input) !== serialized) throw new Error('Feedback event identity does not match the original request.');
+        this.db.exec('COMMIT'); return { job, reused: true };
+      }
+      const expected = action.kind === 'feedback' ? 'awaiting_feedback' : 'awaiting_approval';
+      if (!['proposal', 'feedback'].includes(action.kind) || action.consumedAt || action.binding !== binding || job.status !== expected) throw new Error('Feedback is stale or has already been used.');
+      const time = now();
+      this.db.prepare('UPDATE slack_actions SET consumedAt=? WHERE jobId=? AND consumedAt IS NULL').run(time, job.id);
+      this.db.prepare('INSERT INTO slack_feedback_requests VALUES(?,?,?,?,?)').run(this.projectId, requestId, job.id, serialized, time);
+      this.db.prepare("UPDATE slack_jobs SET kind='feedback',status='queued',inputJson=?,updatedAt=? WHERE id=?")
+        .run(JSON.stringify({ ...Object(input), command: (job.input as { command: string }).command }), time, job.id);
+      this.db.exec('COMMIT'); return { job: this.get(job.id), reused: false };
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   close(): void {

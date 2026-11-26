@@ -327,4 +327,21 @@ describe('assistant feedback exclusion', () => {
     expect(result.warnings.join(' ')).toContain('Fewer replies');
     expect(result.messages.map(message => message.ts)).toEqual([root.ts, reply.ts]);
   });
+  it('includes only explicit feedback receipts while still excluding other assistant output', async () => {
+    const receipt = {...assistant, ts: '1732000004.000005', text: '사용자 피드백: 선택 칩만 변경'};
+    const {client} = mockClient([{ok: true, messages: [{...root, reply_count: 4}, reply, otherReply, assistant, receipt]}]);
+    const result = await collectThread(rootUrl, scope, client, {...exclusion, includedMessageTs: [receipt.ts]});
+    expect(result.status).toBe('complete');
+    expect(result.messages.map(message => message.text)).toContain(receipt.text);
+    expect(result.messages.map(message => message.text)).not.toContain(assistant.text);
+    expect(result.messages.find(message => message.ts === receipt.ts)?.permalink).toBe(sourceLink(receipt.ts));
+  });
+  it('does not include an allowlisted receipt from a different thread', async () => {
+    const receipt = {...assistant, ts: '1732000004.000005', thread_ts: '1731999999.000001'};
+    const {client} = mockClient([{ok: true, messages: [root, reply, otherReply, receipt]}]);
+    const result = await collectThread(rootUrl, scope, client, {...exclusion, includedMessageTs: [receipt.ts]});
+    expect(result.status).toBe('partial');
+    expect(result.messages.some(message => message.ts === receipt.ts)).toBe(false);
+  });
+
 });

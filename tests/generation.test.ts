@@ -131,9 +131,94 @@ describe('paid transport boundary using mocked requests only', () => {
     const second = new FileImplementer(file); expect(second.promptVersion).not.toBe(first.promptVersion);
     await expect(first.implement(input)).resolves.toEqual(changes());
     await expect(second.implement(input)).resolves.toEqual(changed);
-    const { client, parse } = provider({ output_parsed: changes() });
+    const { client, parse } = provider({ output_parsed: {summary:'Enable',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'}]}]} });
     await expect(new OpenAIImplementer(c, { client }).implement(input)).resolves.toEqual(changes());
     expect(parse.mock.calls[0]![0].instructions).toContain('Use Korean');
     expect(parse.mock.calls[0]![0].input).not.toContain(context.repoPath);
+  });
+});
+
+describe('OpenAI surgical edits materialize into the existing whole-file contract', () => {
+  const patch = () => ({summary:'Enable',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'}]}]});
+  const input = (c = config(), repository = context) => ({analysis:{summary:'버튼 활성화',requirements:[],questions:[]},plan,context:repository,config:c});
+  async function generate(output: unknown, options = input()) {
+    const fake = provider({output_parsed:output});
+    const result = await new OpenAIImplementer(options.config,{client:fake.client}).implement(options);
+    return {...fake,result};
+  }
+  it('changes only exact anchors and returns complete file contents with the unchanged public shape', async () => {
+    const {result,parse} = await generate(patch());
+    expect(result).toEqual(changes());
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse.mock.calls[0]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'file_edits',strict:true}}});
+    expect(parse.mock.calls[0]![0].instructions).toContain('same original file');
+    expect(parse.mock.calls[0]![0].instructions).toContain('without an automatic retry');
+  });
+  it('supports independent original anchors in any order without editing unrelated content', async () => {
+    const repository = {...context,files:[{path:'src/app.ts',content:'prefix\nconst first = 1;\nconst second = 2;\nsuffix\n'}]};
+    const output = {summary:'정확한 두 위치 변경',files:[{path:'src/app.ts',kind:'edit',replacements:[
+      {old:'const second = 2;',new:'const second = 20;'}, {old:'const first = 1;',new:'const first = 10;'},
+    ]}]};
+    const {result} = await generate(output,input(config(),repository));
+    expect(result.files[0]!.content).toBe('prefix\nconst first = 10;\nconst second = 20;\nsuffix\n');
+  });
+  it('preserves CRLF, Unicode and literal replacement characters without regex/substitution semantics', async () => {
+    const repository = {...context,files:[{path:'src/app.ts',content:'// 원문\r\nconst label = "전";\r\n// 끝\r\n'}]};
+    const output = {summary:'레이블 변경',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'const label = "전";',new:'const label = "$& $` $1 후";'}]}]};
+    expect((await generate(output,input(config(),repository))).result.files[0]!.content).toBe('// 원문\r\nconst label = "$& $` $1 후";\r\n// 끝\r\n');
+  });
+  it('accepts explicit create and delete and permits deleting text with an empty new string', async () => {
+    const {result} = await generate({summary:'파일 변경',files:[{path:'src/app.ts',kind:'delete'},{path:'tests/new.ts',kind:'create',content:'export {};\n'}]});
+    expect(result.files).toEqual([{path:'src/app.ts',content:null},{path:'tests/new.ts',content:'export {};\n'}]);
+    expect((await generate({summary:'주석 삭제',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'export ',new:''}]}]})).result.files[0]!.content).toBe('const enabled = false;\n');
+  });
+  it.each([
+    ['unmatched old', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'not present',new:'x'}]}]}],
+    ['empty old', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'',new:'x'}]}]}],
+    ['same old and new', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled',new:'enabled'}]}]}],
+    ['no replacements', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[]}]}],
+    ['overlap', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'},{old:'false;',new:'true;'}]}]}],
+    ['new output anchor', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled = false',new:'enabled = true'},{old:'enabled = true',new:'enabled = null'}]}]}],
+    ['duplicate paths', {summary:'x',files:[...patch().files,...patch().files]}],
+    ['unseen edit', {summary:'x',files:[{path:'tests/new.ts',kind:'edit',replacements:[{old:'anything',new:'x'}]}]}],
+    ['unseen delete', {summary:'x',files:[{path:'tests/new.ts',kind:'delete'}]}],
+    ['create existing', {summary:'x',files:[{path:'src/app.ts',kind:'create',content:'replacement'}]}],
+    ['unknown operation', {summary:'x',files:[{path:'src/app.ts',kind:'shell',command:'touch /tmp/no'}]}],
+    ['extra authority', {summary:'x',files:patch().files,approved:true}],
+    ['old whole-file provider shape', changes()],
+    ['binary new', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled',new:'a\0b'}]}]}],
+    ['credential new', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'enabled',new:`sk-${'x'.repeat(30)}`}]}]}],
+    ['credential summary', {summary:`xoxb-${'x'.repeat(30)}`,files:patch().files}],
+    ['unplanned path', {summary:'x',files:[{path:'src/not-planned.ts',kind:'create',content:'export {};'}]}],
+    ['traversal path', {summary:'x',files:[{path:'src/../outside',kind:'create',content:'export {};'}]}],
+  ])('rejects %s after exactly one provider response without a retry', async (_name, output) => {
+    const options = input(); const {client,parse} = provider({output_parsed:output});
+    await expect(new OpenAIImplementer(options.config,{client}).implement(options)).rejects.toThrow();
+    expect(parse).toHaveBeenCalledTimes(1);
+  });
+  it.each(['same same','aaaa'])('rejects multiple or overlapping occurrences of an anchor in %s', async original => {
+    const repository = {...context,files:[{path:'src/app.ts',content:original}]};
+    const old = original === 'aaaa' ? 'aaa' : 'same';
+    await expect(generate({summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old,new:'other'}]}]},input(config(),repository))).rejects.toThrow('ambiguous');
+  });
+  it('rejects omitted files, scope escape and final-content byte limits after materializing', async () => {
+    await expect(generate(patch(),input(config(),{...context,omittedPaths:['src/app.ts']}))).rejects.toThrow('omitted');
+    const c = config(); c.development!.writePaths = ['tests'];
+    await expect(generate(patch(),input(c))).rejects.toThrow('write scope');
+    const large = {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'false',new:'한'.repeat(100)}]}]};
+    const limited = config(); limited.development!.maxFileBytes = 256;
+    await expect(generate(large,input(limited))).rejects.toThrow('file size');
+    limited.development!.maxFileBytes = 1000; limited.development!.maxChangeBytes = 256;
+    await expect(generate(large,input(limited))).rejects.toThrow('total size');
+  });
+  it('can change a small rule inside a 30 KiB original with a short response', async () => {
+    const original = '/* unrelated stylesheet */\n' + '.unchanged { color: black; }\n'.repeat(1100) + '.target { padding: 8px; }\n';
+    const repository = {...context,files:[{path:'src/app.ts',content:original}]};
+    const output = {summary:'간격 수정',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'.target { padding: 8px; }',new:'.target { padding: 12px; }'}]}]};
+    const {result,parse} = await generate(output,input(config(),repository));
+    expect(Buffer.byteLength(JSON.stringify(output))).toBeLessThan(300);
+    expect(Buffer.byteLength(result.files[0]!.content!)).toBeGreaterThan(30_000);
+    expect(result.files[0]!.content).toBe(original.replace('padding: 8px','padding: 12px'));
+    expect(parse.mock.calls[0]![0].max_output_tokens).toBe(8192);
   });
 });

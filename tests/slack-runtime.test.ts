@@ -29,7 +29,7 @@ function setup(blocking = false) {
   const transport = { ephemeral: vi.fn(async () => {}), message: vi.fn(async () => {}), modal: vi.fn(async () => {}) } satisfies SlackTransport;
   const log = vi.fn(), controller = new SlackSocketController(service, transport, log);
   resources.push({ directory, store, controller });
-  return { service, store, backend, transport, log, controller };
+  return { service, store, backend, transport, log, controller, analysis, plan };
 }
 afterEach(async () => {
   for (const resource of resources.splice(0)) { await resource.controller.stop(); resource.store.close(); rmSync(resource.directory, { recursive: true, force: true }); }
@@ -122,5 +122,74 @@ describe('SlackSocketController with durable service and fake transport', () => 
     } });
     expect(fixture.transport.ephemeral).toHaveBeenCalledWith('C1', 'U1', { text: expect.stringContaining('Analysis changed') });
     expect(fixture.transport.modal).not.toHaveBeenCalled();
+  });
+});
+
+function proposalRuntime() {
+  const fixture = setup(), proposal = { analysis: fixture.analysis, plan: fixture.plan };
+  const backend = Object.assign(fixture.backend, {
+    prepareProposal: vi.fn(async (_thread: string, feedback?: import('../src/slack-service.js').SlackFeedbackInput) => {
+      if (feedback) { proposal.analysis.revisionId = 'revision-2'; proposal.plan.bindingHash = 'binding-2'; }
+      return structuredClone(proposal);
+    }),
+    inspectProposal: vi.fn(() => structuredClone(proposal)),
+    approveProposal: vi.fn(async () => ({ runId: 'implementation2', prUrl: 'https://github.com/owner/repo/pull/2' })),
+  });
+  return { ...fixture, backend };
+}
+const proposalButton = (actionId: string, nonce: string) => ({ ...interactiveIdentity, type: 'block_actions', channel: { id: 'C1' }, trigger_id: 'trigger1', actions: [{ action_id: actionId, value: nonce }] });
+const feedbackView = (nonce: string, text: string) => ({ ...interactiveIdentity, type: 'view_submission', view: { callback_id: 'sd_feedback_submit', private_metadata: nonce, state: { values: { feedback_text: { value: { value: text } } } } } });
+
+describe('proposal Socket Mode interaction', () => {
+  it('opens N feedback after acknowledgement and waits for submitted feedback acknowledgement before paid preparation', async () => {
+    const fixture = proposalRuntime(), { id, action } = await analyze(fixture), events: string[] = [];
+    fixture.transport.modal.mockImplementation(async () => { events.push('modal'); });
+    await fixture.controller.interactive({ envelope_id: 'no-1', ack: async () => { events.push('button-ack'); }, body: proposalButton('sd_proposal_no', action.nonce) });
+    await fixture.controller.idle();
+    expect(events).toEqual(['button-ack', 'modal']);
+    expect(fixture.backend.prepareProposal).toHaveBeenCalledTimes(1); expect(fixture.backend.approveProposal).not.toHaveBeenCalled();
+    const feedbackNonce = fixture.store.pendingAction(id)!.nonce;
+    const prepare = fixture.backend.prepareProposal.getMockImplementation()!;
+    fixture.backend.prepareProposal.mockImplementation(async (...args) => { events.push('prepare'); return prepare(...args); });
+    await fixture.controller.interactive({ envelope_id: 'feedback-1', ack: async () => { events.push('submission-ack'); }, body: feedbackView(feedbackNonce, '웹만 변경해 주세요.') });
+    await fixture.controller.idle();
+    expect(events.slice(-2)).toEqual(['submission-ack', 'prepare']);
+    expect(fixture.store.get(id).status).toBe('awaiting_approval');
+    expect(fixture.transport.message).toHaveBeenLastCalledWith('C1', '1795086841.177069', expect.objectContaining({ text: expect.stringContaining('기능 구현') }));
+    expect(fixture.store.get(id).result).toMatchObject({ analysis: { revisionId: 'revision-2' } });
+    expect(fixture.backend.approveProposal).not.toHaveBeenCalled();
+    const newNonce = fixture.store.pendingAction(id)!.nonce;
+    fixture.backend.approveProposal.mockImplementation(async () => { events.push('implement'); return { runId: 'implementation2', prUrl: 'https://github.com/owner/repo/pull/2' }; });
+    await fixture.controller.interactive({ envelope_id: 'yes-1', ack: async () => { events.push('yes-ack'); }, body: proposalButton('sd_proposal_yes', newNonce) });
+    await fixture.controller.idle();
+    expect(events.slice(-2)).toEqual(['yes-ack', 'implement']); expect(fixture.backend.approveProposal).toHaveBeenCalledTimes(1);
+  });
+  it('keeps invalid feedback in its modal and safely acknowledges duplicate valid submissions', async () => {
+    const fixture = proposalRuntime(), { id, action } = await analyze(fixture);
+    await fixture.controller.interactive({ envelope_id: 'no-1', ack: async () => {}, body: proposalButton('sd_proposal_no', action.nonce) });
+    await fixture.controller.idle();
+    const nonce = fixture.store.pendingAction(id)!.nonce, invalidAck = vi.fn(async (_payload?: object) => {});
+    await fixture.controller.interactive({ envelope_id: 'invalid-1', ack: invalidAck, body: feedbackView(nonce, '  ') });
+    expect(invalidAck).toHaveBeenCalledWith({ response_action: 'errors', errors: { feedback_text: expect.stringContaining('1–3000') } });
+    expect(fixture.store.get(id).status).toBe('awaiting_feedback');
+    const ack = vi.fn(async (_payload?: object) => {}), event = { envelope_id: 'feedback-1', ack, body: feedbackView(nonce, '웹만 변경') };
+    await fixture.controller.interactive(event); await fixture.controller.idle();
+    await fixture.controller.interactive(event); await fixture.controller.idle();
+    expect(ack).toHaveBeenCalledTimes(2); expect(ack.mock.calls.every(call => call.length === 0)).toBe(true);
+    expect(fixture.backend.prepareProposal).toHaveBeenCalledTimes(2);
+  });
+  it('acknowledges feedback slash commands before preparation and restores new Y/N through status after a lost notification', async () => {
+    const fixture = proposalRuntime(), { id } = await analyze(fixture), events: string[] = [];
+    const prepare = fixture.backend.prepareProposal.getMockImplementation()!;
+    fixture.backend.prepareProposal.mockImplementation(async (...args) => { events.push('prepare'); return prepare(...args); });
+    fixture.transport.message.mockRejectedValueOnce(new Error('delivery lost'));
+    await fixture.controller.command({ envelope_id: 'feedback-command', ack: async () => { events.push('ack'); }, body: commandBody(`feedback ${id} 웹만 변경`) });
+    await fixture.controller.idle();
+    expect(events).toEqual(['ack', 'prepare']);
+    const ack = vi.fn(async (_payload?: object) => {});
+    await fixture.controller.command({ envelope_id: 'status2', ack, body: commandBody(`status ${id}`) });
+    await fixture.controller.idle();
+    expect(JSON.stringify(ack.mock.calls)).toContain('sd_proposal_yes'); expect(JSON.stringify(ack.mock.calls)).toContain('sd_proposal_no');
+    expect(fixture.backend.prepareProposal).toHaveBeenCalledTimes(2); expect(fixture.backend.approveProposal).not.toHaveBeenCalled();
   });
 });

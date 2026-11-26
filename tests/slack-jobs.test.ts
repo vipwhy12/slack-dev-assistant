@@ -77,3 +77,49 @@ describe('SlackJobStore', () => {
     store.finish(job.id, 'completed', {});
   });
 });
+
+describe('proposal feedback transactions', () => {
+  function proposal() {
+    const fixture = setup(), job = fixture.store.enqueue(request()).job;
+    fixture.store.claimNext();
+    const action = fixture.store.finish(job.id, 'awaiting_approval', { analysis: { revisionId: 'revision-1' } }, null, { kind: 'proposal', binding: 'proposal-1' })!;
+    return { ...fixture, job, action };
+  }
+  it('invalidates approval and creates a feedback action in one transaction visible to another connection', () => {
+    const { store, path, job, action } = proposal(), other = setup('test', path).store;
+    expect(() => store.beginFeedback(action.nonce, 'wrong')).toThrow(/stale/);
+    expect(other.get(job.id).status).toBe('awaiting_approval');
+    const feedback = store.beginFeedback(action.nonce, 'proposal-1');
+    expect(other.get(job.id).status).toBe('awaiting_feedback');
+    expect(other.action(action.nonce).consumedAt).not.toBeNull();
+    expect(other.pendingAction(job.id)).toEqual(feedback);
+    expect(() => other.queueAction(action.nonce, 'proposal-1', {})).toThrow(/stale|already/);
+    expect(() => other.queueAction(feedback.nonce, 'proposal-1', {})).toThrow(/stale|already/);
+    expect(other.claimNext()).toBeUndefined();
+  });
+  it('deduplicates feedback while atomically invalidating every old action and retaining the original command identity', () => {
+    const { store, path, job, action } = proposal(), other = setup('test', path).store;
+    const input = { id: 'feedback-1', actor: 'U1', text: '웹만', previous: { analysis: { revisionId: 'revision-1' } } };
+    const first = store.queueFeedback(action.nonce, 'proposal-1', input.id, input);
+    expect(first).toMatchObject({ reused: false, job: { kind: 'feedback', status: 'queued', input: { ...input, command: 'analyze' } } });
+    expect(other.queueFeedback(action.nonce, 'proposal-1', input.id, input).reused).toBe(true);
+    expect(() => other.queueFeedback(action.nonce, 'proposal-1', input.id, { ...input, actor: 'U2' })).toThrow(/identity/);
+    expect(store.pendingAction(job.id)).toBeUndefined();
+    expect(store.enqueue(request()).reused).toBe(true);
+    const claimed = other.claimNext()!;
+    const next = other.finish(claimed.id, 'awaiting_approval', { analysis: { revisionId: 'revision-2' } }, null, { kind: 'proposal', binding: 'proposal-2' })!;
+    expect(store.queueFeedback(action.nonce, 'proposal-1', input.id, input).reused).toBe(true);
+    expect(store.pendingAction(job.id)!.nonce).toBe(next.nonce);
+    expect(() => store.queueFeedback(action.nonce, 'proposal-1', 'different-event', input)).toThrow(/stale|already/);
+  });
+  it('rejects a stale feedback transaction without consuming the current action or exposing another project receipt', () => {
+    const { store, path, job, action } = proposal(), other = setup('foreign', path).store;
+    const feedback = store.beginFeedback(action.nonce, 'proposal-1');
+    expect(() => store.queueFeedback(feedback.nonce, 'wrong', 'event', {})).toThrow(/stale/);
+    expect(store.get(job.id).status).toBe('awaiting_feedback'); expect(store.action(feedback.nonce).consumedAt).toBeNull();
+    expect(store.feedbackRequest('event')).toBeUndefined();
+    store.queueFeedback(feedback.nonce, 'proposal-1', 'event', { actor: 'U1', text: '웹만' });
+    expect(other.feedbackRequest('event')).toBeUndefined();
+    expect(() => other.queueFeedback(feedback.nonce, 'proposal-1', 'event', {})).toThrow(/project/);
+  });
+});

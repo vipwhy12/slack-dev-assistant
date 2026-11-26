@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configSchema, type ProjectConfig } from '../src/config.js';
 import type { AnalysisDraft } from '../src/analysis.js';
 import type { RepositoryContext } from '../src/repository.js';
-import { FilePlanner, OpenAIPlanner, PLAN_INSTRUCTIONS, renderPlan, validatePlan, type PlanDraft } from '../src/planning.js';
+import { FilePlanner, OpenAIPlanner, PLAN_INSTRUCTIONS, generatedPlanSchema, renderPlan, validatePlan, type PlanDraft } from '../src/planning.js';
 import type { GenerationClient } from '../src/generation.js';
 
 const directories: string[] = [];
@@ -35,6 +35,38 @@ describe('plan evidence and scope validation', () => {
     const input = plan(); expect(validatePlan(input, analysis(), context, config(), ['R1'])).toEqual(input);
     input.items[0]!.acceptanceChecks[0]!.commandId = null;
     expect(validatePlan(input, analysis(), context, config(), ['R1'])).toEqual(input);
+  });
+  it('preserves legacy plan serialization while new generated plans require a title and impact analysis', () => {
+    const legacy = plan();
+    const validated = validatePlan(legacy, analysis(), context, config(), ['R1']);
+    expect(JSON.stringify(validated)).toBe(JSON.stringify(legacy));
+    expect(validated).not.toHaveProperty('sideEffects');
+    expect(validated).not.toHaveProperty('title');
+    expect(() => generatedPlanSchema.parse(legacy)).toThrow();
+    expect(() => generatedPlanSchema.parse({ ...legacy, sideEffects: [] })).toThrow();
+    expect(generatedPlanSchema.parse({ ...legacy, title: '기능 활성화', sideEffects: [] })).toMatchObject({ title: '기능 활성화', sideEffects: [] });
+  });
+  it('requires a concise nonempty single-line title when supplied', () => {
+    for (const title of ['', ' ', '가'.repeat(81), '기능\n활성화', '기능\r활성화', '기능\r\n활성화']) {
+      expect(() => validatePlan({ ...plan(), title }, analysis(), context, config(), ['R1'])).toThrow();
+    }
+    expect(validatePlan({ ...plan(), title: '거래 내역 필터 색상 변경' }, analysis(), context, config(), ['R1']).title).toBe('거래 내역 필터 색상 변경');
+  });
+  it('validates each side effect against actual scoped code without claiming execution', () => {
+    const input = { ...plan(), sideEffects: [{ text: '공유 플래그를 읽는 경로의 활성 상태가 바뀔 수 있다.',
+      codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], verification: '플래그를 읽는 호출부의 반환값을 확인한다.' }] };
+    expect(validatePlan(input, analysis(), context, config(), ['R1'])).toEqual(input);
+    input.sideEffects[0]!.codeRefs[0]!.quote = 'enabled = true';
+    expect(() => validatePlan(input, analysis(), context, config(), ['R1'])).toThrow(/code evidence/);
+    input.sideEffects[0]!.codeRefs = [];
+    expect(() => validatePlan(input, analysis(), context, config(), ['R1'])).toThrow();
+  });
+  it('rejects side effect references outside context/read scope and unexpected grant fields', () => {
+    const effect = { text: '호출부의 반환값이 바뀔 수 있다.', codeRefs: [{ path: 'src/app.ts', quote: 'enabled = false' }], verification: '호출부를 확인한다.' };
+    const c = config(); c.development!.readPaths = ['tests'];
+    expect(() => validatePlan({ ...plan(), sideEffects: [effect] }, analysis(), context, c, ['R1'])).toThrow(/code evidence/);
+    expect(() => validatePlan({ ...plan(), sideEffects: [{ ...effect, codeRefs: [{ path: 'src/missing.ts', quote: 'enabled' }] }] }, analysis(), context, config(), ['R1'])).toThrow(/code evidence/);
+    expect(() => validatePlan({ ...plan(), sideEffects: [{ ...effect, approved: true }] }, analysis(), context, config(), ['R1'])).toThrow();
   });
   it.each([
     ['unselected', (p: PlanDraft) => { p.items[0]!.requirementIds = ['R2']; }],
@@ -99,13 +131,19 @@ describe('planner adapters and report', () => {
     await expect(second.plan(input)).resolves.toEqual(changed);
   });
   it('uses structured output and sends scoped repository data without local paths or credentials', async () => {
-    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: plan(), output: [] });
+    const generated = { ...plan(), title: '기능 활성화', sideEffects: [] };
+    const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({ status: 'completed', output_parsed: generated, output: [] });
     const c = config(); const planner = new OpenAIPlanner(c, { client: { responses: { parse } } });
-    await expect(planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).resolves.toEqual(plan());
+    await expect(planner.plan({ analysis: analysis(), context, config: c, requirementIds: ['R1'] })).resolves.toEqual(generated);
     const request = parse.mock.calls[0]![0];
     expect(request.instructions).toBe(PLAN_INSTRUCTIONS);
     expect(request.instructions).toContain('Use Korean');
+    expect(request.instructions).toContain('Do not invent generic risks');
+    expect(request.instructions).toContain('sideEffects');
+    expect(request.instructions).toContain('short Korean noun phrase');
     expect(request).toMatchObject({ store: false, max_output_tokens: 8192, text: { format: { strict: true } } });
+    expect(request.text.format).toMatchObject({ schema: { required: expect.arrayContaining(['title', 'sideEffects']) } });
+    expect(request.text.format).toMatchObject({ schema: { properties: { title: { pattern: '\\S', minLength: 1, maxLength: 80 } } } });
     expect(request.input).not.toContain(context.repoPath);
     expect(request.input).not.toContain(c.storageDir);
     expect(JSON.parse(request.input).commands).toEqual([{ id: 'test' }]);
@@ -113,8 +151,16 @@ describe('planner adapters and report', () => {
   it('escapes untrusted markup in human-readable plans', () => {
     const p = plan(); p.summary = '<script>alert(1)</script> [visit](https://evil.test)';
     const rendered = renderPlan(p, context);
-    expect(rendered).toContain('Draft only'); expect(rendered).toContain('abc123');
+    expect(rendered).toContain('계획 초안'); expect(rendered).toContain('abc123');
+    expect(rendered).toContain('## 요약\n\n'); expect(rendered).toContain('## 기능 구현\n\n');
+    expect(rendered).toContain('## 사이드 이펙트\n\n');
     expect(rendered).not.toContain('<script>'); expect(rendered).not.toContain('https://evil.test');
     expect(rendered).toContain('A1 → test');
+  });
+  it('uses the short title for the heading while retaining the full summary', () => {
+    const p = plan(); p.title = '거래 내역 필터 색상 변경'; p.summary = '거래 내역의 선택한 필터에 배경색을 적용하고 다른 필터로 바꾸면 이전 선택 표시를 지웁니다.';
+    const rendered = renderPlan(p, context);
+    expect(rendered.split('\n')[0]).toBe('# \\[거래 내역 필터 색상 변경 요구사항\\]');
+    expect(rendered).toContain(`## 요약\n\n${p.summary.replace('.', '\\.')}`);
   });
 });

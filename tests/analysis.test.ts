@@ -129,6 +129,14 @@ describe('analysis evidence and relations', () => {
     expect(validateAnalysis({ summary: 'No actionable discussion.', requirements: [], questions: [] }, snapshot()).requirements).toEqual([]);
   });
 
+  it('preserves old analysis shapes and keeps a separate concise title when present', () => {
+    const original = draft();
+    expect(validateAnalysis(original, snapshot())).toEqual(original);
+    expect(validateAnalysis(original, snapshot())).not.toHaveProperty('title');
+    const titled = { ...original, title: 'CSV 내보내기' };
+    expect(validateAnalysis(titled, snapshot())).toEqual(titled);
+  });
+
   it('retains conflicting alternatives with their shared blocking question', () => {
     const source = snapshot();
     source.messages[1]!.text = 'Use UTC timestamps. Use local timestamps instead; no agreement yet.';

@@ -15,7 +15,7 @@ const identitySchema = z.object({ team: z.object({ id: z.string() }), api_app_id
 const commandSchema = z.object({ team_id: z.string(), api_app_id: z.string(), user_id: z.string(), channel_id: z.string(), command: z.string(), text: z.string() });
 const actionSchema = identitySchema.extend({ type: z.literal('block_actions'), channel: z.object({ id: z.string() }), trigger_id: z.string(),
   actions: z.array(z.object({ action_id: z.string(), value: z.string() })).length(1) });
-const viewSchema = identitySchema.extend({ type: z.literal('view_submission'), view: z.object({ callback_id: z.literal('sd_review_submit'),
+const viewSchema = identitySchema.extend({ type: z.literal('view_submission'), view: z.object({ callback_id: z.enum(['sd_review_submit', 'sd_feedback_submit']),
   private_metadata: z.string(), state: z.object({ values: z.record(z.string(), z.record(z.string(), z.object({
     value: z.string().nullable().optional(), selected_options: z.array(z.object({ value: z.string() })).optional(),
   }).passthrough())) }) }) });
@@ -50,11 +50,16 @@ export class SlackSocketController {
     if (submission.success) {
       const body = submission.data;
       try {
-        const values = this.service.parseReviewValues(body.view.private_metadata, body.view.state.values);
-        await this.service.handleReviewSubmission({ teamId: body.team.id, appId: body.api_app_id, userId: body.user.id,
-          privateMetadata: body.view.private_metadata, ...values });
+        if (body.view.callback_id === 'sd_feedback_submit') {
+          await this.service.handleFeedbackSubmission({ teamId: body.team.id, appId: body.api_app_id, userId: body.user.id,
+            privateMetadata: body.view.private_metadata, text: body.view.state.values.feedback_text?.value?.value ?? '', envelopeId: event.envelope_id });
+        } else {
+          const values = this.service.parseReviewValues(body.view.private_metadata, body.view.state.values);
+          await this.service.handleReviewSubmission({ teamId: body.team.id, appId: body.api_app_id, userId: body.user.id,
+            privateMetadata: body.view.private_metadata, ...values });
+        }
       } catch (error) {
-        await event.ack({ response_action: 'errors', errors: { review_reason: safeError(error).message.slice(0, 1000) } });
+        await event.ack({ response_action: 'errors', errors: { [body.view.callback_id === 'sd_feedback_submit' ? 'feedback_text' : 'review_reason']: safeError(error).message.slice(0, 1000) } });
         return;
       }
       await event.ack(); this.kick(); return;
@@ -109,7 +114,14 @@ export async function serveSlack(config: ProjectConfig): Promise<{ stop(): Promi
   const [readAuth, botAuth] = await Promise.all([checkConnection(config, readToken), checkConnection(config, botToken, client)]);
   if ([readAuth.teamId, botAuth.teamId].some(id => id !== config.slackApp!.teamId)) throw new Error('Slack tokens do not match slackApp.teamId.');
   const store = new SlackJobStore(join(config.storageDir, 'slack-jobs.sqlite'), config.projectId);
-  const service = new SlackService(config, store, createSlackBackend(config, readToken, botAuth.userId, botAuth.botId));
+  const service = new SlackService(config, store, createSlackBackend(config, readToken, botAuth.userId, botAuth.botId, {
+    async postFeedback(input) {
+      const posted = await client.chat.postMessage({ channel: input.channelId, thread_ts: input.threadTs, text: input.text,
+        parse: 'none', mrkdwn: false, unfurl_links: false, unfurl_media: false });
+      if (!posted.ts) throw new Error('Slack feedback delivery did not return a message timestamp. Inspect the thread before resuming.');
+      return { ts: posted.ts };
+    },
+  }));
   const controller = new SlackSocketController(service, {
     async ephemeral(channel, user, reply) {
       await client.chat.postEphemeral({ channel, user, text: escape(reply.text), blocks: reply.blocks as unknown as Extract<ChatPostMessageArguments, { blocks: unknown }>['blocks'], parse: 'none' });

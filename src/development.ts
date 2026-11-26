@@ -12,6 +12,7 @@ import { validatePlan, renderPlan, type PlanDraft, type Planner } from './planni
 import { validateChanges, type Implementer, type ChangeSet } from './generation.js';
 import { DockerRunner, type VerificationRunner, type VerificationResult } from './runner.js';
 import { publishDraft } from './publisher.js';
+import { markdownText, renderImplementationReport, renderPullRequestBody, renderPullRequestTitle } from './presentation.js';
 
 const VERSION = 'development-v1';
 const openStore = (config: ProjectConfig) => new RunStore(join(config.storageDir, 'history.sqlite'));
@@ -164,27 +165,9 @@ function assertFileState(worktree: string, context: RepositoryContext, changes: 
   }
 }
 function reportImplementation(plan: PlanDraft, checkpoint: Checkpoint, runId: string, source: AnalysisDraft, snapshot: ReturnType<RunStore['getSnapshot']>) {
-  const escape = (value: string) => value.replace(/[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/g, '\\$&').replace(/[\r\n]/g, ' ');
-  const lines = ['# Implementation report', '', `Run: ${runId}`, `Commit: ${checkpoint.commitSha ?? 'not committed'}`, `PR: ${checkpoint.prUrl ?? 'not published'}`, '',
-    'This is a reviewable draft. Command success is evidence of execution, not proof that every requirement is semantically correct.', '', '## Verification', '', '| Phase | Command | Result | Exit code |', '| --- | --- | --- | --- |'];
-  for (const [phase, results] of [['baseline', checkpoint.baseline], ['after', checkpoint.verification]] as const) for (const result of results ?? []) lines.push(`| ${phase} | ${result.commandId} | ${result.status} | ${result.exitCode ?? '—'} |`);
-  lines.push('', '## Requirement evidence', '', '| Requirement | Planned files | Criterion | Verification |', '| --- | --- | --- | --- |');
-  for (const item of plan.items) for (const id of item.requirementIds) {
-    const requirement = source.requirements.find(r => r.id === id)!;
-    for (const criterion of requirement.acceptanceCriteria) {
-      const check = item.acceptanceChecks.find(value => value.criterionId === criterion.id);
-      const result = checkpoint.verification?.find(value => value.commandId === check?.commandId);
-      lines.push(`| ${escape(id)} | ${item.affectedPaths.map(escape).join(', ')} | ${escape(criterion.id)} | ${check?.commandId ? `${result?.status ?? 'not_run'} (${escape(check.commandId)})` : 'not_run (manual review required)'} |`);
-    }
-    for (const ref of requirement.sourceRefs) {
-      const message = snapshot.messages.find(m => m.id === ref.messageVersionId)!;
-      const url = new URL(message.permalink);
-      if (url.protocol !== 'https:' || !url.hostname.endsWith('.slack.com')) throw new Error('Invalid source link in implementation report.');
-      lines.push('', `- ${escape(id)}: [Slack source](<${url.href.replace(/[<>]/g, character => encodeURIComponent(character))}>)`);
-    }
-  }
-  return lines.join('\n') + '\n';
+  return renderImplementationReport({ plan, checkpoint, runId, source, snapshot });
 }
+
 export async function implementPlan(options: ImplementOptions) {
   const { config, implementer } = options;
   const development = requireDevelopment(config);
@@ -286,12 +269,12 @@ export async function implementPlan(options: ImplementOptions) {
     const reportPath = join(directory, 'report.md');
     const prBodyPath = join(directory, 'pr-body.md');
     writeArtifact(reportPath, reportImplementation(plan, checkpoint, runId, analysis, snapshot), true);
-    // Keep Slack message contents and internal evidence links out of external PR text.
-    writeArtifact(prBodyPath, `Implements reviewed plan ${options.planId}.\n\nRequirements: ${currentPlan.requirementIds.join(', ')}\n\nVerification: ${checkpoint.verification?.map(result => `${result.commandId}: ${result.status}`).join('; ')}\n\nThis draft requires human review. Detailed evidence and any manual checks are in the local run report.\n\nslack-dev-run: ${runId}\n`, true);
+    // Publish approved changes and checks without appending raw Slack evidence or notifying mentions.
+    writeArtifact(prBodyPath, renderPullRequestBody({ plan, checkpoint, runId, source: analysis, snapshot, planId: options.planId }), true);
     if (options.publish && !checkpoint.prUrl) {
       checkPlan(store, config, options.planId, true);
       stepId = store.startStep(runId, 'publish', hash({ commit: checkpoint.commitSha, github: config.github }));
-      const published = await (options.publisher ?? publishDraft)(config, worktree.path, worktree.branch, prBodyPath, `Implement Slack plan ${options.planId}`);
+      const published = await (options.publisher ?? publishDraft)(config, worktree.path, worktree.branch, prBodyPath, renderPullRequestTitle({ plan, checkpoint, runId, source: analysis, snapshot }));
       checkpoint.prUrl = published.url;
       save(); store.finishStep(stepId, checkpoint.prUrl); stepId = undefined;
       writeArtifact(reportPath, reportImplementation(plan, checkpoint, runId, analysis, snapshot), true);
@@ -303,7 +286,7 @@ export async function implementPlan(options: ImplementOptions) {
   } catch (error) {
     const failure = safeError(error);
     if (runId && currentPlan) {
-      try { writeArtifact(join(config.storageDir, 'runs', runId, 'report.md'), reportImplementation(currentPlan.plan, checkpoint, runId, currentPlan.analysis, currentPlan.snapshot) + `\nFailure: ${failure.message}\n`, true); } catch { /* Keep the original failure. */ }
+      try { writeArtifact(join(config.storageDir, 'runs', runId, 'report.md'), reportImplementation(currentPlan.plan, checkpoint, runId, currentPlan.analysis, currentPlan.snapshot) + `\n실패 원인: ${markdownText(failure.message)}\n`, true); } catch { /* Keep the original failure. */ }
     }
     if (stepId) store.finishStep(stepId, undefined, failure);
     if (runId) store.status(runId, 'failed', failure);

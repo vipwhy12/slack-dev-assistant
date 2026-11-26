@@ -124,7 +124,7 @@ function canonicalPermalink(workspace: string, channelId: string, ts: string, ro
 }
 
 /** Read one authorized thread. Incomplete collection never silently becomes a complete snapshot. */
-export async function collectThread(url: string, scope: SlackScope, client: SlackApi, options: { excludedUserIds?: string[]; excludedBotIds?: string[] } = {}): Promise<ThreadSnapshot> {
+export async function collectThread(url: string, scope: SlackScope, client: SlackApi, options: { excludedUserIds?: string[]; excludedBotIds?: string[]; includedMessageTs?: string[] } = {}): Promise<ThreadSnapshot> {
   const parsed = parseThreadUrl(url, scope);
   const { workspace, channelId, messageTs } = parsed;
   let rootTs = parsed.rootTs;
@@ -199,8 +199,9 @@ export async function collectThread(url: string, scope: SlackScope, client: Slac
     const right = BigInt(b.replace('.', ''));
     return left < right ? -1 : left > right ? 1 : 0;
   })) {
-    // Assistant outputs must not become source evidence on the next command.
-    if ((message.user && options.excludedUserIds?.includes(message.user)) || (message.bot_id && options.excludedBotIds?.includes(message.bot_id))) {
+    // Only persisted, authenticated feedback receipts may opt back into the source.
+    // Ordinary assistant results remain excluded; thread membership was checked above.
+    if (!options.includedMessageTs?.includes(ts) && ((message.user && options.excludedUserIds?.includes(message.user)) || (message.bot_id && options.excludedBotIds?.includes(message.bot_id)))) {
       if (ts === rootTs || ts === messageTs) throw new Error('Use an original discussion message, not an assistant result, as the thread link.');
       continue;
     }

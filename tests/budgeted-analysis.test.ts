@@ -23,7 +23,7 @@ function snapshot(channelId = 'CONE', text = '버튼을 추가한다.', id = 'cu
     ]};
   return {...value, contentHash: snapshotContentHash(value)};
 }
-const draft: AnalysisDraft = {summary: '버튼 추가', requirements: [{id: 'R1', statement: '버튼을 추가한다.', decisionState: 'proposed',
+const draft: AnalysisDraft = {title: '버튼 추가', summary: '버튼 추가', requirements: [{id: 'R1', statement: '버튼을 추가한다.', decisionState: 'proposed',
   sourceRefs: [{messageVersionId: 'current-message', quote: '버튼을 추가한다.'}], supersedesIds: [], blockingQuestionIds: [], acceptanceCriteria: []}], questions: []};
 function client(output: unknown = draft) {
   const parse = vi.fn<GenerationClient['responses']['parse']>().mockResolvedValue({status: 'completed', output_parsed: output, output: [], usage: {input_tokens: 100, output_tokens: 20, total_tokens: 120}});
@@ -116,5 +116,78 @@ describe('budgeted analysis and supplemental knowledge boundaries', () => {
     const fake = client();
     await expect(new BudgetedAnalyzer(config, url, {client: fake.client}).analyze(snapshot('CONE', 'x'.repeat(230_000)))).rejects.toThrow('context limit');
     expect(fake.parse).not.toHaveBeenCalled();
+  });
+});
+
+describe('one bounded correction for exact source evidence only', () => {
+  const response = (output: unknown, usage = {input_tokens:100,output_tokens:20,total_tokens:120}) => ({status:'completed',output_parsed:output,output:[],usage});
+  function invalid() {
+    const output = structuredClone(draft);
+    output.requirements[0]!.sourceRefs[0]!.quote = '버튼을 추가하세요.';
+    return output;
+  }
+  it('corrects one invalid quote with the identical source and records both budgeted requests', async () => {
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(invalid())).mockResolvedValueOnce(response(draft));
+    const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
+    await expect(analyzer.analyze(snapshot())).resolves.toEqual(draft);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    expect(analyzer.promptVersion).toContain('budgeted-v4');
+    const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
+    const {correction,...source} = second;
+    expect(source).toEqual(first); expect(correction.invalidDraft).toEqual(invalid());
+    expect(correction.validationError).toContain('Evidence quote does not match');
+    expect(fake.parse.mock.calls[1]![0]).toMatchObject({max_output_tokens:8192,store:false,text:{format:{name:'slack_requirements_repair'}}});
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('only correction attempt');
+    expect(fake.parse.mock.calls[1]![0].instructions).toContain('untrusted diagnostic data');
+    expect(analyzer.usage).toMatchObject({inputTokens:200,outputTokens:40,totalTokens:240});
+    const usage = analyzer.usage as {attempts:Array<{reservationId:string}>};
+    expect(usage.attempts).toHaveLength(2); expect(usage.attempts[0]!.reservationId).not.toBe(usage.attempts[1]!.reservationId);
+    const ledger = new BudgetLedger(directory); try {expect(ledger.summary().requests).toBe(2);expect(ledger.summary().reservedOrSpentUsd).toBeCloseTo(0.000144);} finally {ledger.close();}
+  });
+  it('permits one correction of an unknown message ID but never accepts evidence outside the snapshot', async () => {
+    const output = structuredClone(draft); output.requirements[0]!.sourceRefs[0]!.messageVersionId = 'not-in-this-thread';
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(output)).mockResolvedValueOnce(response(draft));
+    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).resolves.toEqual(draft);
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fake.parse.mock.calls[1]![0].input).correction.validationError).toContain('Unknown evidence');
+  });
+  it('stops after two invalid drafts without string normalization or a third model request', async () => {
+    const fake = client(invalid());
+    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('Evidence quote does not match');
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    const ledger = new BudgetLedger(directory); try {expect(ledger.summary().requests).toBe(2);} finally {ledger.close();}
+  });
+  it('does not call the provider for correction if the next conservative reservation exceeds the budget', async () => {
+    // The first response has unknown usage, retaining its full reservation; a second cannot fit in $0.50.
+    const constrained = {...config,development:{budgetUsd:0.5} as ProjectConfig['development']};
+    const fake = client(); fake.parse.mockResolvedValue({status:'completed',output_parsed:invalid(),output:[]});
+    await expect(new BudgetedAnalyzer(constrained,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('API budget would be exceeded');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+    const ledger = new BudgetLedger(directory,0.5); try {expect(ledger.summary().requests).toBe(1);} finally {ledger.close();}
+  });
+  it('never retries network/provider failures, malformed schema, or other analysis invariants', async () => {
+    const fake = client(); fake.parse.mockRejectedValue(new Error('500 provider failure'));
+    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(snapshot())).rejects.toThrow('500 provider failure');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+    const malformed = client({...draft,approved:true});
+    await expect(new BudgetedAnalyzer(config,url,{client:malformed.client}).analyze(snapshot())).rejects.toThrow();
+    expect(malformed.parse).toHaveBeenCalledTimes(1);
+    const duplicate = structuredClone(draft); duplicate.requirements.push(structuredClone(duplicate.requirements[0]!));
+    const other = client(duplicate);
+    await expect(new BudgetedAnalyzer(config,url,{client:other.client}).analyze(snapshot())).rejects.toThrow();
+    expect(other.parse).toHaveBeenCalledTimes(1);
+  });
+  it('never retries a correction request that itself fails at the provider', async () => {
+    const fake = client(); fake.parse.mockReset().mockResolvedValueOnce(response(invalid())).mockRejectedValueOnce(new Error('500 on repair'));
+    const analyzer = new BudgetedAnalyzer(config,url,{client:fake.client});
+    await expect(analyzer.analyze(snapshot())).rejects.toThrow('500 on repair');
+    expect(fake.parse).toHaveBeenCalledTimes(2);
+    expect(analyzer.usage).toMatchObject({inputTokens:100,outputTokens:20,totalTokens:120,attempts:[expect.objectContaining({inputTokens:100}),null]});
+  });
+  it('freezes the source so an in-flight caller mutation cannot replace the validation evidence', async () => {
+    const source = snapshot(); const fake = client();
+    fake.parse.mockReset().mockImplementationOnce(async () => {source.messages[0]!.text='호출 중 변경';return response(invalid());}).mockResolvedValueOnce(response(draft));
+    await expect(new BudgetedAnalyzer(config,url,{client:fake.client}).analyze(source)).resolves.toEqual(draft);
+    expect(JSON.parse(fake.parse.mock.calls[1]![0].input).messages[0].text).toBe('버튼을 추가한다.');
   });
 });

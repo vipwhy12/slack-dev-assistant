@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from './config.js';
-import { containsCredential, controllerEnvironment, git, validateWorktree } from './repository.js';
+import { containsCredential, controllerEnvironment, getRepoCommit, git, pathAllowed, validateWorktree } from './repository.js';
 
 const execFileAsync = promisify(execFile);
 export interface PublishResult { url: string }
@@ -46,6 +46,18 @@ export async function publishDraft(
   if (target.toLowerCase() !== identity) throw new Error('GitHub repository identity changed.');
   const gitPrefix = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never',
     '-c', 'core.sshCommand=ssh -o BatchMode=yes', '-c', 'credential.https://github.com.helper=!gh auth git-credential'];
+  const base = (await executor('git', [...gitPrefix, 'ls-remote', '--heads', github.remote, `refs/heads/${github.baseBranch}`], worktreePath, env)).trim().split(/\s+/);
+  const approvedBase = getRepoCommit(config);
+  if (base.length !== 2 || base[1] !== `refs/heads/${github.baseBranch}` || base[0] !== approvedBase) {
+    throw new Error('PR base does not match the reviewed repository commit. Prepare a clean checkout of the latest base branch and approve a new proposal.');
+  }
+  try { git(worktreePath, ['merge-base', '--is-ancestor', approvedBase, commit]); }
+  catch { throw new Error('Implementation does not descend from the reviewed PR base.'); }
+  const prPaths = git(worktreePath, ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', `${approvedBase}...${commit}`]).split('\0').filter(Boolean);
+  if (!config.development || !prPaths.length || prPaths.length > config.development.maxChangedFiles ||
+    prPaths.some(path => !pathAllowed(path, config.development!.writePaths) || /(^|\/)AGENTS\.md$/i.test(path))) {
+    throw new Error('The complete PR diff is outside the configured development scope.');
+  }
   const remoteHead = (await executor('git', [...gitPrefix, 'ls-remote', '--heads', github.remote, `refs/heads/${branch}`], worktreePath, env)).trim();
   if (remoteHead) {
     const [sha, reference] = remoteHead.split(/\s+/);
