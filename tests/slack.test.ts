@@ -252,3 +252,96 @@ describe('SDK retries', () => {
     expect(() => createSlackClient(' ')).toThrow('SLACK_TOKEN');
   });
 });
+
+describe('assistant feedback exclusion', () => {
+  const assistant = {ts: '1732000003.000004', thread_ts: root.ts, user: 'UASSISTANT', bot_id: 'BASSISTANT', text: 'Generated analysis and approval buttons'};
+  const exclusion = {excludedUserIds: ['UASSISTANT']};
+
+  it('excludes own bot outputs after completeness counting without changing the source hash or warnings', async () => {
+    const {client, getPermalink} = mockClient([
+      {ok: true, messages: [root, reply, otherReply]},
+      {ok: true, messages: [{...root, reply_count: 3}, reply, otherReply, {...assistant, attachments: [{title: 'Generated result'}]}]},
+      {ok: true, messages: [{...root, reply_count: 4}, reply, otherReply, {...assistant, text: 'Edited generated result'}, {...assistant, ts: '1732000004.000005', text: 'Generated plan'}]},
+    ]);
+    const before = await collectThread(rootUrl, scope, client, exclusion);
+    const after = await collectThread(rootUrl, scope, client, exclusion);
+    const later = await collectThread(rootUrl, scope, client, exclusion);
+    expect(after.status).toBe('complete'); expect(later.status).toBe('complete');
+    expect(after.messages).toEqual(before.messages); expect(later.messages).toEqual(before.messages);
+    expect(after.contentHash).toBe(before.contentHash); expect(later.contentHash).toBe(before.contentHash);
+    expect(after.warnings).toEqual([]); expect(later.warnings).toEqual([]);
+    expect(getPermalink).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(after)).not.toContain('Generated');
+  });
+
+  it('excludes assistant messages identified only by bot_id while preserving other bots', async () => {
+    const botOnly = {ts: assistant.ts, thread_ts: root.ts, bot_id: 'BASSISTANT', text: 'Generated bot-only analysis'};
+    const {client, getPermalink} = mockClient([
+      {ok: true, messages: [root, reply, otherReply]},
+      {ok: true, messages: [{...root, reply_count: 3}, reply, otherReply, botOnly]},
+    ]);
+    const before = await collectThread(rootUrl, scope, client, {excludedBotIds: ['BASSISTANT']});
+    const after = await collectThread(rootUrl, scope, client, {excludedBotIds: ['BASSISTANT']});
+    expect(after.status).toBe('complete');
+    expect(after.messages).toEqual(before.messages);
+    expect(after.messages[2]?.author).toBe('B123');
+    expect(after.contentHash).toBe(before.contentHash);
+    expect(after.warnings).toEqual([]);
+    expect(getPermalink).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(after)).not.toContain('Generated bot-only analysis');
+  });
+
+  it('rejects assistant-authored roots and explicit assistant reply links as source discussions', async () => {
+    const botRoot = mockClient([{ok: true, messages: [{...root, user: 'UASSISTANT', bot_id: 'BASSISTANT', reply_count: 0}]}]);
+    await expect(collectThread(rootUrl, scope, botRoot.client, exclusion)).rejects.toThrow('original discussion message');
+    const botReply = mockClient([{ok: true, messages: [{...root, reply_count: 3}, reply, otherReply, assistant]}]);
+    await expect(collectThread(sourceLink(assistant.ts), scope, botReply.client, exclusion)).rejects.toThrow('original discussion message');
+  });
+
+  it('rejects a bare assistant reply link after discovering its parent thread', async () => {
+    const {client, replies} = mockClient([
+      {ok: true, messages: [assistant]},
+      {ok: true, messages: [{...root, reply_count: 3}, reply, otherReply, assistant]},
+    ]);
+    await expect(collectThread(sourceLink(assistant.ts).split('?')[0]!, scope, client, exclusion)).rejects.toThrow('original discussion message');
+    expect(replies).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves other bots and leaves the default CLI collection behavior unchanged', async () => {
+    const another = {...otherReply, user: 'UOTHERBOT', bot_id: 'BOTHER', text: 'Issue tracker domain evidence'};
+    const first = mockClient([{ok: true, messages: [{...root, reply_count: 3}, reply, another, assistant]}]);
+    const filtered = await collectThread(rootUrl, scope, first.client, exclusion);
+    expect(filtered.messages.map(message => message.author)).toEqual(['U123', 'U456', 'UOTHERBOT']);
+    expect(filtered.messages[2]?.text).toBe('Issue tracker domain evidence');
+    const second = mockClient([{ok: true, messages: [{...root, reply_count: 3}, reply, otherReply, assistant]}]);
+    const unfiltered = await collectThread(rootUrl, scope, second.client);
+    expect(unfiltered.messages).toHaveLength(4);
+    expect(unfiltered.messages[2]?.author).toBe('B123');
+    expect(unfiltered.messages[3]?.author).toBe('UASSISTANT');
+  });
+
+  it('does not hide genuinely missing human replies when assistant replies are excluded', async () => {
+    const {client} = mockClient([{ok: true, messages: [{...root, reply_count: 3}, reply, assistant]}]);
+    const result = await collectThread(rootUrl, scope, client, exclusion);
+    expect(result.status).toBe('partial');
+    expect(result.warnings.join(' ')).toContain('Fewer replies');
+    expect(result.messages.map(message => message.ts)).toEqual([root.ts, reply.ts]);
+  });
+  it('includes only explicit feedback receipts while still excluding other assistant output', async () => {
+    const receipt = {...assistant, ts: '1732000004.000005', text: '사용자 피드백: 선택 칩만 변경'};
+    const {client} = mockClient([{ok: true, messages: [{...root, reply_count: 4}, reply, otherReply, assistant, receipt]}]);
+    const result = await collectThread(rootUrl, scope, client, {...exclusion, includedMessageTs: [receipt.ts]});
+    expect(result.status).toBe('complete');
+    expect(result.messages.map(message => message.text)).toContain(receipt.text);
+    expect(result.messages.map(message => message.text)).not.toContain(assistant.text);
+    expect(result.messages.find(message => message.ts === receipt.ts)?.permalink).toBe(sourceLink(receipt.ts));
+  });
+  it('does not include an allowlisted receipt from a different thread', async () => {
+    const receipt = {...assistant, ts: '1732000004.000005', thread_ts: '1731999999.000001'};
+    const {client} = mockClient([{ok: true, messages: [root, reply, otherReply, receipt]}]);
+    const result = await collectThread(rootUrl, scope, client, {...exclusion, includedMessageTs: [receipt.ts]});
+    expect(result.status).toBe('partial');
+    expect(result.messages.some(message => message.ts === receipt.ts)).toBe(false);
+  });
+
+});

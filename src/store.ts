@@ -5,21 +5,33 @@ import { randomUUID } from 'node:crypto';
 import type { ThreadSnapshot } from './domain.js';
 import type { AnalysisDraft } from './analysis.js';
 
-export type RunStatus = 'queued' | 'collecting' | 'analyzing' | 'needs_input' | 'ready' | 'failed' | 'reused';
+export type RunStatus = 'queued' | 'collecting' | 'analyzing' | 'planning' | 'implementing' | 'verifying' | 'needs_input' | 'ready' | 'review_ready' | 'failed' | 'reused' | 'stale';
 export interface RunRecord {
   id: string; project_id: string; mode: string; status: RunStatus; created_at: string;
   finished_at: string | null; input_json: string; input_hash: string | null;
   snapshot_id: string | null; error_json: string | null; reused_run_id: string | null;
 }
+export interface PlanRecord {
+  id: string; run_id: string; source_run_id: string; spec_revision_id: string; snapshot_id: string;
+  repo_commit_sha: string; config_hash: string; binding_hash: string; created_at: string;
+  requirement_ids_json: string; context_json: string; data_json: string;
+}
+export interface GrantRecord {
+  id: string; plan_id: string; binding_hash: string; actor: string; reason: string; allow_pr: number; created_at: string;
+}
+export interface ImplementationRecord {
+  run_id: string; plan_id: string; grant_id: string; checkpoint_json: string;
+}
 const now = () => new Date().toISOString();
 export class RunStore {
   private db: DatabaseSync;
   private lockId?: string;
-  constructor(path: string) {
+  constructor(path: string, busyTimeoutMs = 5000) {
+    if (!Number.isInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 5000) throw new Error('Invalid database busy timeout');
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     chmodSync(path, 0o600);
-    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
+    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${busyTimeoutMs}; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, config_json TEXT NOT NULL, config_hash TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs(
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), mode TEXT NOT NULL,
@@ -32,7 +44,18 @@ export class RunStore {
       CREATE TABLE IF NOT EXISTS spec_revisions(id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), parent_id TEXT REFERENCES spec_revisions(id), created_at TEXT NOT NULL, origin TEXT NOT NULL, review_state TEXT NOT NULL, data_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS interventions(id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), revision_id TEXT NOT NULL REFERENCES spec_revisions(id), created_at TEXT NOT NULL, reason TEXT NOT NULL, minutes REAL NOT NULL CHECK(minutes>=0), actor TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS process_lock(id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, pid INTEGER NOT NULL);
-      PRAGMA user_version=1;`);
+      CREATE TABLE IF NOT EXISTS plan_revisions(
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), source_run_id TEXT NOT NULL REFERENCES runs(id),
+        spec_revision_id TEXT NOT NULL REFERENCES spec_revisions(id), snapshot_id TEXT NOT NULL,
+        repo_commit_sha TEXT NOT NULL, config_hash TEXT NOT NULL, binding_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL, requirement_ids_json TEXT NOT NULL, context_json TEXT NOT NULL, data_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS execution_grants(
+        id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES plan_revisions(id), binding_hash TEXT NOT NULL,
+        actor TEXT NOT NULL, reason TEXT NOT NULL, allow_pr INTEGER NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS implementations(
+        run_id TEXT PRIMARY KEY REFERENCES runs(id), plan_id TEXT NOT NULL REFERENCES plan_revisions(id),
+        grant_id TEXT NOT NULL UNIQUE REFERENCES execution_grants(id), checkpoint_json TEXT NOT NULL);
+      PRAGMA user_version=2;`);
   }
   acquireLock(): void {
     this.db.exec('BEGIN IMMEDIATE');
@@ -46,7 +69,7 @@ export class RunStore {
         if (alive) throw new Error('Another run is active in this storage directory. Retry when it finishes.');
         this.db.prepare('DELETE FROM process_lock WHERE id=1').run();
         const interrupted = JSON.stringify({ code: 'interrupted', message: 'Previous CLI process exited before finishing.', retryable: true });
-        this.db.prepare("UPDATE runs SET status='failed',finished_at=?,error_json=? WHERE status IN ('queued','collecting','analyzing')").run(now(), interrupted);
+        this.db.prepare("UPDATE runs SET status='failed',finished_at=?,error_json=? WHERE status IN ('queued','collecting','analyzing','planning','implementing','verifying')").run(now(), interrupted);
         this.db.prepare("UPDATE run_steps SET status='failed',finished_at=?,error_json=? WHERE status='running'").run(now(), interrupted);
       }
       const owner = randomUUID();
@@ -62,13 +85,13 @@ export class RunStore {
   saveProject(id: string, config: unknown, configHash: string): void {
     this.db.prepare('INSERT INTO projects VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json,config_hash=excluded.config_hash').run(id, JSON.stringify(config), configHash);
   }
-  createRun(projectId: string, input: unknown): string {
+  createRun(projectId: string, input: unknown, mode: 'analyze' | 'plan' | 'implement' = 'analyze'): string {
     const id = randomUUID();
-    this.db.prepare('INSERT INTO runs(id,project_id,mode,status,created_at,input_json) VALUES(?,?,?, ?,?,?)').run(id, projectId, 'analyze', 'queued', now(), JSON.stringify(input));
+    this.db.prepare('INSERT INTO runs(id,project_id,mode,status,created_at,input_json) VALUES(?,?,?, ?,?,?)').run(id, projectId, mode, 'queued', now(), JSON.stringify(input));
     return id;
   }
   status(id: string, status: RunStatus, error?: unknown): void {
-    const terminal = ['ready', 'needs_input', 'failed', 'reused'].includes(status);
+    const terminal = ['ready', 'needs_input', 'review_ready', 'failed', 'reused', 'stale'].includes(status);
     this.db.prepare('UPDATE runs SET status=?,finished_at=?,error_json=? WHERE id=?').run(status, terminal ? now() : null, error ? JSON.stringify(error) : null, id);
   }
   setInputHash(id: string, inputHash: string): void { this.db.prepare('UPDATE runs SET input_hash=? WHERE id=?').run(inputHash, id); }
@@ -93,6 +116,13 @@ export class RunStore {
     if (!row) throw new Error('Run has no collected snapshot.');
     return JSON.parse(row.data_json) as ThreadSnapshot;
   }
+  latestSnapshot(projectId: string, snapshot: ThreadSnapshot): ThreadSnapshot {
+    const row = this.db.prepare(`SELECT s.data_json FROM thread_snapshots s JOIN runs r ON r.id=s.run_id
+      WHERE r.project_id=? AND json_extract(s.data_json,'$.workspace')=? AND json_extract(s.data_json,'$.channelId')=?
+      AND json_extract(s.data_json,'$.rootTs')=? ORDER BY r.rowid DESC LIMIT 1`)
+      .get(projectId, snapshot.workspace, snapshot.channelId, snapshot.rootTs) as { data_json: string } | undefined;
+    return row ? JSON.parse(row.data_json) as ThreadSnapshot : snapshot;
+  }
   startStep(runId: string, name: string, inputHash: string): string {
     const id = randomUUID();
     this.db.prepare('INSERT INTO run_steps(id,run_id,name,status,started_at,input_hash) VALUES(?,?,?,?,?,?)').run(id, runId, name, 'running', now(), inputHash);
@@ -106,8 +136,8 @@ export class RunStore {
     this.db.prepare('INSERT INTO spec_revisions VALUES(?,?,?,?,?,?,?)').run(id, runId, null, now(), 'model', 'pending', JSON.stringify(draft));
     return id;
   }
-  latestRevision(runId: string): { id: string; origin: string; data_json: string } {
-    const revision = this.db.prepare('SELECT id,origin,data_json FROM spec_revisions WHERE run_id=? ORDER BY rowid DESC LIMIT 1').get(runId) as { id: string; origin: string; data_json: string } | undefined;
+  latestRevision(runId: string): { id: string; origin: string; review_state: string; data_json: string } {
+    const revision = this.db.prepare('SELECT id,origin,review_state,data_json FROM spec_revisions WHERE run_id=? ORDER BY rowid DESC LIMIT 1').get(runId) as { id: string; origin: string; review_state: string; data_json: string } | undefined;
     if (!revision) throw new Error('Run has no analysis to review.');
     return revision;
   }
@@ -132,10 +162,44 @@ export class RunStore {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('Limit must be an integer from 1 to 1000.');
     return this.db.prepare('SELECT * FROM runs WHERE project_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(projectId, limit) as unknown as RunRecord[];
   }
-  detail(id: string): { run: RunRecord; steps: unknown[]; revisions: unknown[]; interventions: unknown[] } {
+  savePlan(plan: Omit<PlanRecord, 'created_at'>): void {
+    this.db.prepare('INSERT INTO plan_revisions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(plan.id, plan.run_id, plan.source_run_id,
+      plan.spec_revision_id, plan.snapshot_id, plan.repo_commit_sha, plan.config_hash, plan.binding_hash, now(),
+      plan.requirement_ids_json, plan.context_json, plan.data_json);
+  }
+  getPlan(id: string): PlanRecord {
+    const plan = this.db.prepare('SELECT * FROM plan_revisions WHERE id=?').get(id) as unknown as PlanRecord | undefined;
+    if (!plan) throw new Error(`Plan not found: ${id}`);
+    return plan;
+  }
+  findPlan(inputHash: string, projectId: string): PlanRecord | undefined {
+    return this.db.prepare("SELECT p.* FROM plan_revisions p JOIN runs r ON r.id=p.run_id WHERE r.input_hash=? AND r.project_id=? AND r.status IN ('needs_input','ready') ORDER BY r.rowid DESC LIMIT 1").get(inputHash, projectId) as unknown as PlanRecord | undefined;
+  }
+  grant(planId: string, bindingHash: string, actor: string, reason: string, allowPr: boolean): GrantRecord {
+    if (!actor.trim() || !reason.trim()) throw new Error('Plan approval requires an actor and a reason.');
+    const grant = { id: randomUUID(), plan_id: planId, binding_hash: bindingHash, actor, reason, allow_pr: allowPr ? 1 : 0, created_at: now() };
+    this.db.prepare('INSERT INTO execution_grants VALUES(?,?,?,?,?,?,?)').run(grant.id, grant.plan_id, grant.binding_hash, actor, reason, grant.allow_pr, grant.created_at);
+    return grant;
+  }
+  getGrant(id: string): GrantRecord {
+    const row = this.db.prepare('SELECT * FROM execution_grants WHERE id=?').get(id) as unknown as GrantRecord | undefined;
+    if (!row) throw new Error(`Execution grant not found: ${id}`);
+    return row;
+  }
+  startImplementation(runId: string, planId: string, grantId: string, checkpoint: unknown): void {
+    this.db.prepare('INSERT INTO implementations VALUES(?,?,?,?)').run(runId, planId, grantId, JSON.stringify(checkpoint));
+  }
+  checkpoint(runId: string, value: unknown): void { this.db.prepare('UPDATE implementations SET checkpoint_json=? WHERE run_id=?').run(JSON.stringify(value), runId); }
+  findImplementation(grantId: string): ImplementationRecord | undefined {
+    return this.db.prepare('SELECT * FROM implementations WHERE grant_id=?').get(grantId) as unknown as ImplementationRecord | undefined;
+  }
+  detail(id: string): { run: RunRecord; steps: unknown[]; revisions: unknown[]; interventions: unknown[]; plans: unknown[]; grants: unknown[]; implementation: unknown } {
     return { run: this.getRun(id),
       steps: this.db.prepare('SELECT * FROM run_steps WHERE run_id=? ORDER BY rowid').all(id),
       revisions: this.db.prepare('SELECT * FROM spec_revisions WHERE run_id=? ORDER BY rowid').all(id),
-      interventions: this.db.prepare('SELECT * FROM interventions WHERE run_id=? ORDER BY rowid').all(id) };
+      interventions: this.db.prepare('SELECT * FROM interventions WHERE run_id=? ORDER BY rowid').all(id),
+      plans: this.db.prepare('SELECT * FROM plan_revisions WHERE run_id=? OR source_run_id=? ORDER BY rowid').all(id, id),
+      grants: this.db.prepare('SELECT g.* FROM execution_grants g JOIN plan_revisions p ON p.id=g.plan_id WHERE p.run_id=? OR p.source_run_id=? ORDER BY g.rowid').all(id, id),
+      implementation: this.db.prepare('SELECT * FROM implementations WHERE run_id=?').get(id) ?? null };
   }
 }

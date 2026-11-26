@@ -1,0 +1,28 @@
+{
+  "projectId": "your-app",
+  "slack": {
+    "workspace": "your-workspace",
+    "channelIds": ["C0123456789"]
+  },
+  "storageDir": ".slack-dev/your-app",
+  "repoPath": "../your-app",
+  "model": "gpt-4.1-mini",
+  "development": {
+    "readPaths": ["src", "test", "package.json"],
+    "writePaths": ["src", "test"],
+    "commands": [
+      {
+        "id": "unit",
+        "program": "node",
+        "args": ["--test"]
+      }
+    ],
+    "dockerImage": "node:24",
+    "budgetUsd": 10
+  },
+  "github": {
+    "repository": "your-org/your-app",
+    "baseBranch": "main",
+    "remote": "origin"
+  }
+}

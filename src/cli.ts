@@ -5,13 +5,19 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { userInfo } from 'node:os';
 import { loadConfig } from './config.js';
-import { OpenAIAnalyzer } from './analysis.js';
+import { BudgetedAnalyzer } from './budgeted-analysis.js';
+import { saveKnowledge, queryKnowledge } from './knowledge-workflow.js';
+import { FileKnowledgeExtractor, OpenAIKnowledgeExtractor } from './knowledge.js';
+import { serveSlack } from './slack-runtime.js';
 import { createSlackClient, collectThread } from './slack.js';
 import { analyzeThread, FileAnalyzer, reviewRun, safeError } from './workflow.js';
 import { RunStore } from './store.js';
 import { checkConnection, collectSnapshot } from './connection.js';
+import { planRun, approvePlan, implementPlan } from './development.js';
+import { FilePlanner, OpenAIPlanner } from './planning.js';
+import { FileImplementer, OpenAIImplementer, BudgetLedger, IMPLEMENTATION_PROMPT_VERSION, implementationModel } from './generation.js';
 
-const program = new Command().name('slack-dev').version('0.1.0')
+const program = new Command().name('slack-dev').version('0.2.0')
   .description('Analyze Slack discussions into evidence-linked requirement drafts.');
 const configOption = () => new Option('-c, --config <path>', 'project configuration JSON').default('slack-dev.config.json');
 const json = (value: unknown) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -37,7 +43,7 @@ program.command('analyze').argument('<thread-url>', 'allowed Slack thread permal
     const config = loadConfig(options.config);
     if (!options.snapshot && !process.env.SLACK_TOKEN) throw new Error('SLACK_TOKEN is required for live Slack collection.');
     if (!options.analysisFile && !process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is required for live analysis.');
-    const analyzer = options.analysisFile ? new FileAnalyzer(options.analysisFile) : new OpenAIAnalyzer({ model: config.model });
+    const analyzer = options.analysisFile ? new FileAnalyzer(options.analysisFile) : new BudgetedAnalyzer(config, threadUrl);
     const result = await analyzeThread({ config, threadUrl, analyzer, force: options.force,
       collect: options.snapshot
         ? async () => JSON.parse(readFileSync(options.snapshot!, 'utf8'))
@@ -45,6 +51,33 @@ program.command('analyze').argument('<thread-url>', 'allowed Slack thread permal
     });
     json(result);
     if (!result.reportPath) process.exitCode = 2;
+  });
+program.command('save').argument('<thread-url>').addOption(configOption())
+  .description('Normalize domain knowledge with exact source evidence into SQLite')
+  .option('--snapshot <path>', 'replay a collected thread without Slack calls')
+  .option('--knowledge-file <path>', 'replay a knowledge draft without model calls')
+  .action(async (threadUrl: string, options: {config: string; snapshot?: string; knowledgeFile?: string}) => {
+    const config = loadConfig(options.config);
+    if (!options.snapshot && !process.env.SLACK_TOKEN) throw new Error('SLACK_TOKEN is required for live collection.');
+    json(await saveKnowledge({ config, threadUrl,
+      extractor: options.knowledgeFile ? new FileKnowledgeExtractor(options.knowledgeFile) : new OpenAIKnowledgeExtractor(config),
+      collect: options.snapshot ? async () => JSON.parse(readFileSync(options.snapshot!, 'utf8'))
+        : () => collectThread(threadUrl, config.slack, createSlackClient(process.env.SLACK_TOKEN!)),
+    }));
+  });
+program.command('knowledge').argument('[query]', 'literal search text', '').addOption(configOption())
+  .option('--limit <count>', 'maximum results (1–200)', '20')
+  .description('Search current unreviewed knowledge and exact source evidence')
+  .action((query: string, options: {config: string; limit: string}) => {
+    json(queryKnowledge(loadConfig(options.config), query, Number(options.limit)));
+  });
+program.command('serve-slack').addOption(configOption())
+  .description('Listen for /duduk commands and review actions using Socket Mode')
+  .action(async (options: {config: string}) => {
+    const server = await serveSlack(loadConfig(options.config));
+    process.stdout.write('Slack Socket Mode connected. Keep this process running to receive commands.\n');
+    const stop = () => { void server.stop().catch(error => { process.stderr.write(`${safeError(error).message}\n`); process.exitCode = 1; }); };
+    process.once('SIGINT', stop); process.once('SIGTERM', stop);
   });
 program.command('history').addOption(configOption()).option('--limit <count>', 'maximum records (1–1000)', '20')
   .action((options: {config: string; limit: string}) => {
@@ -67,9 +100,47 @@ program.command('review').argument('<run-id>').addOption(configOption())
     const config = loadConfig(options.config);
     json(reviewRun(config, runId, JSON.parse(readFileSync(options.file, 'utf8')), options.reason, Number(options.minutes), options.actor));
   });
-for (const mode of ['plan', 'implement']) {
-  program.command(mode).allowUnknownOption().allowExcessArguments()
-    .description('Reserved for a future version')
-    .action(() => { throw new Error(`${mode} is not implemented in this MVP. Use analyze; no repository changes were made.`); });
-}
+program.command('plan').argument('<analyze-run-id>').addOption(configOption())
+  .description('Investigate pinned repository code and create an evidence-linked implementation plan')
+  .option('--requirements <ids>', 'comma-separated requirement IDs; defaults to active requirements')
+  .option('--plan-file <path>', 'replay a plan draft JSON without an LLM call')
+  .option('--force', 'create a new plan instead of reusing identical inputs')
+  .action(async (runId: string, options: {config: string; requirements?: string; planFile?: string; force?: boolean}) => {
+    const config = loadConfig(options.config);
+    const planner = options.planFile ? new FilePlanner(options.planFile) : new OpenAIPlanner(config);
+    json(await planRun({ config, sourceRunId: runId, planner, force: options.force,
+      ...(options.requirements ? { requirementIds: options.requirements.split(',').map(id => id.trim()) } : {}) }));
+  });
+program.command('approve-plan').argument('<plan-id>').addOption(configOption())
+  .description('Record a local execution grant for the exact reviewed specification, plan, commit and configuration')
+  .requiredOption('--reason <text>', 'reason for accepting the plan and execution scope')
+  .option('--actor <name>', 'local reviewer name', userInfo().username)
+  .option('--allow-pr', 'also permit explicit draft PR publication for this plan')
+  .action((planId: string, options: {config: string; reason: string; actor: string; allowPr?: boolean}) => {
+    json(approvePlan(loadConfig(options.config), planId, options.reason, options.actor, options.allowPr));
+  });
+program.command('implement').argument('<plan-id>').addOption(configOption())
+  .description('Apply a granted plan in an isolated worktree, verify in Docker, and optionally publish a draft PR')
+  .requiredOption('--grant <id>', 'execution grant returned by approve-plan')
+  .option('--changes-file <path>', 'replay validated full-file changes without an LLM call')
+  .option('--publish', 'push the verified branch and create/reuse a draft PR; grant must allow PRs')
+  .option('--resume <run-id>', 'resume saved verification/publication, including bounded corrections for code failures')
+  .action(async (planId: string, options: {config: string; grant: string; changesFile?: string; publish?: boolean; resume?: string}) => {
+    const config = loadConfig(options.config);
+    // Instantiate the network adapter lazily: a completed checkpoint can resume without a key.
+    let delegate: OpenAIImplementer | undefined;
+    const implementer = options.changesFile ? new FileImplementer(options.changesFile) : {
+      name: 'openai', model: implementationModel(config), promptVersion: IMPLEMENTATION_PROMPT_VERSION,
+      get usage() { return delegate?.usage; },
+      async implement(input: Parameters<OpenAIImplementer['implement']>[0]) { delegate = new OpenAIImplementer(config); return delegate.implement(input); },
+      async repair(input: Parameters<OpenAIImplementer['repair']>[0]) { delegate ??= new OpenAIImplementer(config); return delegate.repair(input); },
+    };
+    json(await implementPlan({ config, planId, grantId: options.grant, implementer, publish: options.publish, resumeRunId: options.resume }));
+  });
+program.command('budget').addOption(configOption()).description('Show cumulative save/analyze/plan/implement API reservations and estimated usage')
+  .action((options: {config: string}) => {
+    const config = loadConfig(options.config);
+    const ledger = new BudgetLedger(config.storageDir, config.development?.budgetUsd ?? 10);
+    try { json(ledger.summary()); } finally { ledger.close(); }
+  });
 program.parseAsync().catch(error => { process.stderr.write(`Error: ${safeError(error).message}\n`); process.exitCode = 1; });
