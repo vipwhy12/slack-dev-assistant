@@ -193,6 +193,62 @@ describe('OpenAI surgical edits materialize into the existing whole-file contrac
     expect(result.files).toEqual([{path:'src/app.ts',content:null},{path:'tests/new.ts',content:'export {};\n'}]);
     expect((await generate({summary:'주석 삭제',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'export ',new:''}]}]})).result.files[0]!.content).toBe('const enabled = false;\n');
   });
+  it('appends independent tests without matching repeated delimiters or rewriting original bytes', async () => {
+    const original = "it('first', () => { expect(1).toBe(1);\r\n});\r\nit('second', () => { expect(2).toBe(2);\r\n});";
+    const addition = "\r\nit('새 동작', () => { expect(enabled).toBe(true); });\r\n";
+    const repository = { ...context, files: [{ path: 'src/app.ts', content: original }] };
+    const { result, parse } = await generate({ summary: '회귀 테스트 추가', files: [{ path: 'src/app.ts', kind: 'append', content: addition }] }, input(config(), repository));
+    expect(result.files).toEqual([{ path: 'src/app.ts', content: original + addition }]);
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(parse.mock.calls[0]![0].instructions).toContain('Prefer append for new independent tests');
+  });
+  it.each(['', ' \n', 'x\0', 'sk-' + 'x'.repeat(30)])('rejects invalid append content without another request', async content => {
+    const options = input(); const fake = provider({ output_parsed: { summary: 'append', files: [{ path: 'src/app.ts', kind: 'append', content }] } });
+    await expect(new OpenAIImplementer(options.config, { client: fake.client }).implement(options)).rejects.toThrow();
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
+  it('rejects append to unknown, omitted, unapproved or duplicate paths', async () => {
+    const append = { path: 'src/app.ts', kind: 'append', content: '\nexport const extra = true;\n' };
+    const unknown = { ...input(), plan: plannedPaths('tests/unknown.ts') };
+    const cases = [
+      { options: unknown, files: [{ ...append, path: 'tests/unknown.ts' }] },
+      { options: input(config(), { ...context, omittedPaths: ['src/app.ts'] }), files: [append] },
+      { options: { ...input(), plan: plannedPaths('tests/other.ts') }, files: [append] },
+      { options: input(), files: [append, append] },
+    ];
+    for (const { options, files } of cases) {
+      const fake = provider({ output_parsed: { summary: 'append', files } });
+      await expect(new OpenAIImplementer(options.config, { client: fake.client }).implement(options)).rejects.toThrow();
+      expect(fake.parse).toHaveBeenCalledTimes(1);
+    }
+  });
+  it('applies file-count and combined byte limits to append results and keeps full planned-file coverage', async () => {
+    const repository = { ...context, files: [{ path: 'src/app.ts', content: 'a'.repeat(100) }, { path: 'tests/new.ts', content: 'test source' }] };
+    const options = { ...input(config(), repository), plan: plannedPaths('src/app.ts', 'tests/new.ts') };
+    const files = [{ path: 'src/app.ts', kind: 'append', content: 'b'.repeat(200) }, { path: 'tests/new.ts', kind: 'append', content: '\nnew test' }];
+    for (const [field, limit, expected] of [['maxChangedFiles', 1, 'file count'], ['maxFileBytes', 256, 'file size'], ['maxChangeBytes', 256, 'total size']] as const) {
+      const configured = { ...options, config: config() }; configured.config.development![field] = limit;
+      const fake = provider({ output_parsed: { summary: 'append', files } });
+      await expect(new OpenAIImplementer(configured.config, { client: fake.client }).implement(configured)).rejects.toThrow(expected);
+      expect(fake.parse).toHaveBeenCalledTimes(1);
+    }
+    const missing = provider({ output_parsed: { summary: 'append', files: [files[0]!] } });
+    await expect(new OpenAIImplementer(options.config, { client: missing.client }).implement(options)).rejects.toThrow('missing planned files');
+    expect(missing.parse).toHaveBeenCalledTimes(2);
+  });
+  it('reports ambiguous file and match positions so the one correction can use append', async () => {
+    const original = 'first();\n});\nsecond();\n});\n';
+    const options = input(config(), { ...context, files: [{ path: 'src/app.ts', content: original }] });
+    const addition = '\nextraTest();\n';
+    const fake = provider(); fake.parse.mockReset()
+      .mockResolvedValueOnce({ status: 'completed', output: [], output_parsed: { summary: 'add', files: [{ path: 'src/app.ts', kind: 'edit', replacements: [{ old: '});', new: '});' + addition }] }] } })
+      .mockResolvedValueOnce({ status: 'completed', output: [], output_parsed: { summary: 'add', files: [{ path: 'src/app.ts', kind: 'append', content: addition }] } });
+    const result = await new OpenAIImplementer(options.config, { client: fake.client }).implement(options);
+    expect(result.files[0]!.content).toBe(original + addition);
+    const error = JSON.parse(fake.parse.mock.calls[1]![0].input).correction.validationError;
+    expect(error).toContain('src/app.ts; replacement 1; at least 2 matches at offsets 9 and 23');
+    expect(error).toContain('use append'); expect(fake.parse).toHaveBeenCalledTimes(2);
+  });
   it.each([
     ['unmatched old', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'not present',new:'x'}]}]}],
     ['empty old', {summary:'x',files:[{path:'src/app.ts',kind:'edit',replacements:[{old:'',new:'x'}]}]}],
@@ -270,7 +326,7 @@ describe('complete planned file coverage and one bounded implementation correcti
     const result = await implementer.implement(options);
     expect(result.files.map(file=>file.path)).toEqual(['src/app.ts','tests/new.ts']);
     expect(result.files[1]!.content).toBe(testContent);
-    expect(fake.parse).toHaveBeenCalledTimes(2); expect(implementer.promptVersion).toBe('implementation-v5');
+    expect(fake.parse).toHaveBeenCalledTimes(2); expect(implementer.promptVersion).toBe('implementation-v6');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     expect(first.expectedChangedPaths).toEqual(['src/app.ts','tests/new.ts']);
     const {correction,...sameSource} = second; expect(sameSource).toEqual(first);
@@ -341,6 +397,17 @@ describe('bounded implementation repair after failed verification', () => {
   }
   const response = (output: unknown): GenerationResponse => ({ status: 'completed', output: [], output_parsed: output,
     usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } });
+  it('appends to the current repair baseline while retaining earlier planned changes', async () => {
+    const options = input(); options.plan = plannedPaths('src/app.ts', 'tests/new.ts');
+    options.previousChanges.files = [...changes().files, { path: 'tests/new.ts', content: 'existing new test\n' }];
+    const addition = 'additional independent test\n';
+    const fake = provider(response({ summary: '회귀 검증 추가', files: [{ path: 'tests/new.ts', kind: 'append', content: addition }] }));
+    const result = await new OpenAIImplementer(options.config, { client: fake.client }).repair(options);
+    expect(result.files).toEqual([...changes().files, { path: 'tests/new.ts', content: 'existing new test\n' + addition }]);
+    expect(JSON.parse(fake.parse.mock.calls[0]![0].input).repository.files).toEqual(options.previousChanges.files);
+    expect(fake.parse.mock.calls[0]![0].instructions).toContain('EXISTING CURRENT file');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+  });
   it('ignores identical repair entries beside a real fix but rejects no-op-only repair attempts', async () => {
     const options = input(); const output = patch(); output.files[0]!.replacements.push({ old: 'enabled = true', new: 'enabled = true' });
     const fake = provider(response(output));
