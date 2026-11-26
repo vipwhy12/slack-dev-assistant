@@ -1,6 +1,8 @@
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { configSchema, type ProjectConfig } from '../src/config.js';
@@ -326,7 +328,7 @@ describe('complete planned file coverage and one bounded implementation correcti
     const result = await implementer.implement(options);
     expect(result.files.map(file=>file.path)).toEqual(['src/app.ts','tests/new.ts']);
     expect(result.files[1]!.content).toBe(testContent);
-    expect(fake.parse).toHaveBeenCalledTimes(2); expect(implementer.promptVersion).toBe('implementation-v6');
+    expect(fake.parse).toHaveBeenCalledTimes(2); expect(implementer.promptVersion).toBe('implementation-v7');
     const first = JSON.parse(fake.parse.mock.calls[0]![0].input), second = JSON.parse(fake.parse.mock.calls[1]![0].input);
     expect(first.expectedChangedPaths).toEqual(['src/app.ts','tests/new.ts']);
     const {correction,...sameSource} = second; expect(sameSource).toEqual(first);
@@ -434,7 +436,7 @@ describe('bounded implementation repair after failed verification', () => {
     expect(request.instructions).toContain('duplicate'); expect(request.instructions).toContain('actual component DOM');
     expect(request.instructions).toContain('raw-stylesheet assertion pattern');
     expect(request.instructions).toContain('Never make an assertion conditional');
-    expect(request.instructions).toContain('do not delete files, remove assertions, disable checks');
+    expect(request.instructions).toContain('do not delete files, drop coverage, disable checks');
     expect(request.instructions).toContain('subset of repairablePaths');
     expect(request.instructions).toContain('These CURRENT files are the only patch baseline');
     expect(request.instructions).not.toContain('Cover exactly every');
@@ -479,6 +481,38 @@ describe('bounded implementation repair after failed verification', () => {
     const data = JSON.parse(fake.parse.mock.calls[0]![0].input);
     expect(data.repository.files).toEqual(options.previousChanges.files);
     expect(data.repairablePaths).toEqual(['src/app.ts', 'tests/new.ts']);
+  });
+  it('repairs only a newly generated style test against CURRENT content while preserving product CSS and pre-run behavior checks', async () => {
+    const originalTest = "function verifyOriginal(button) { assert.equal(button.getAttribute('data-account'), 'primary'); }\n";
+    const generatedTest = "function verifyNew(button, css) { assert.equal(getComputedStyle(button).backgroundColor, 'rgb(18, 52, 86)'); }\n";
+    const correctedTest = "function verifyNew(button, css) { assert.equal(button.getAttribute('aria-pressed'), 'true'); assert.ok(css.includes('--selected-bg: #123456;')); assert.ok(css.includes('.chip.on { background: var(--selected-bg); }')); }\n";
+    const originalCss = '.chip.on { background: red; }\n';
+    const approvedCss = ':root { --selected-bg: #123456; }\n.chip.on { background: var(--selected-bg); }\n';
+    const options = input(); options.plan = plannedPaths('src/filter.css', 'tests/filter.test.ts');
+    options.plan.items[0]!.codeRefs = [{ path: 'src/filter.css', quote: originalCss }];
+    options.context.files = [{ path: 'src/filter.css', content: originalCss }, { path: 'tests/filter.test.ts', content: originalTest }];
+    options.previousChanges.files = [{ path: 'src/filter.css', content: approvedCss }, { path: 'tests/filter.test.ts', content: originalTest + generatedTest }];
+    options.verification[0]!.stderr = 'Expected rgb(18, 52, 86), received buttonface; test harness does not load the entrypoint stylesheet.';
+    const fake = provider(response({ summary: '선택 스타일 테스트를 raw CSS와 DOM 상태 확인으로 교정', files: [{ path: 'tests/filter.test.ts', kind: 'edit',
+      replacements: [{ old: generatedTest, new: correctedTest }] }] }));
+    const result = await new OpenAIImplementer(options.config, { client: fake.client }).repair(options);
+    expect(result.files).toEqual([{ path: 'src/filter.css', content: approvedCss }, { path: 'tests/filter.test.ts', content: originalTest + correctedTest }]);
+    const payload = JSON.parse(fake.parse.mock.calls[0]![0].input);
+    expect(payload.repository.files).toEqual(options.previousChanges.files);
+    expect(payload).not.toHaveProperty('originalFiles'); expect(payload.verificationRepair).not.toHaveProperty('previousChanges');
+    expect(fake.parse).toHaveBeenCalledTimes(1);
+    const runTest = (content: string, css = approvedCss, pressed = 'true', account = 'primary') => runInNewContext(
+      content + '\nverifyOriginal(button); verifyNew(button, css);',
+      { assert, css, getComputedStyle: () => ({ backgroundColor: 'buttonface' }), button: {
+        getAttribute: (name: string) => name === 'aria-pressed' ? pressed : account,
+      } }, { timeout: 1000 });
+    expect(() => runTest(originalTest + generatedTest)).toThrow();
+    const repairedTests = result.files[1]!.content!;
+    expect(() => runTest(repairedTests)).not.toThrow();
+    expect(() => runTest(repairedTests, approvedCss, 'false')).toThrow();
+    expect(() => runTest(repairedTests, approvedCss.replace('#123456', '#ffffff'))).toThrow();
+    expect(() => runTest(repairedTests, approvedCss.replace('background: var(--selected-bg)', 'background: red'))).toThrow();
+    expect(() => runTest(repairedTests, approvedCss, 'true', 'wrong-account')).toThrow();
   });
   it('revalidates merged repairs against the original files and whole-change byte limits', async () => {
     const options = input();
