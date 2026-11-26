@@ -245,7 +245,8 @@ describe('single-approval proposals and revision-bound feedback', () => {
     const contentBlocks = reply.blocks!.filter(block => ['header', 'section'].includes(block.type as string) && !block.accessory);
     expect(contentBlocks.length).toBeGreaterThan(4);
     expect(contentBlocks.map(block => (block.text as { text: string }).text).join('\n\n')).toBe(reply.text);
-    expect(contentBlocks.every(block => (block.text as { type: string }).type === 'plain_text')).toBe(true);
+    expect(contentBlocks.filter(block => block.type === 'section').every(block => (block.text as { type: string; verbatim: boolean }).type === 'mrkdwn' && (block.text as { verbatim: boolean }).verbatim)).toBe(true);
+    expect(contentBlocks.some(block => (block.text as { text: string }).text.includes('기능 구현\n1.'))).toBe(true);
     const details = await fixture.service.handleAction({ ...identity, actionId: 'sd_proposal_details', value: action.nonce });
     expect(details.modal).toMatchObject({ callback_id: 'sd_proposal_details', private_metadata: action.nonce });
     expect(details.modal!.submit).toBeUndefined();
@@ -298,20 +299,23 @@ describe('single-approval proposals and revision-bound feedback', () => {
     for (const manyParagraphs of [false, true]) {
       const fixture = proposalSetup();
       fixture.analysis.draft.summary = manyParagraphs ? Array.from({ length: 60 }, (_, index) => `문단 ${index}: 모든 내용을 보존합니다.`).join('\n\n') : '긴 기능 설명을 여러 블록으로 나눕니다.';
-      fixture.analysis.draft.requirements[0]!.statement = `${'가'.repeat(2890)}😀${'나'.repeat(3100)} <@U1> *문자 그대로*`;
+      fixture.analysis.draft.requirements[0]!.statement = `${'가'.repeat(2890)}😀${'나'.repeat(3100)} <@U1> <!channel> <https://example.com|링크> & 원문\n다음 줄`;
       const { id } = await analyzed(fixture);
       const reply = fixture.service.handleCommand(command(`status ${id}`));
       const blocks = reply.blocks!.filter(block => ['header', 'section'].includes(block.type as string) && !block.accessory);
       const rendered = blocks.map(block => (block.text as { text: string }).text).join('');
-      expect(rendered.replace(/\s/g, '')).toBe(reply.text.replace(/\s/g, ''));
+      const decoded = rendered.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
+      expect(decoded.replace(/\s/g, '')).toBe(reply.text.replace(/\s/g, ''));
       expect(reply.blocks!.length).toBeLessThanOrEqual(50);
       for (const block of blocks) {
-        const text = block.text as { type: string; text: string };
-        expect(text.type).toBe('plain_text');
+        const text = block.text as { type: string; text: string; verbatim?: boolean };
+        expect(text.type).toBe(block.type === 'header' ? 'plain_text' : 'mrkdwn');
+        if (block.type === 'section') expect(text.verbatim).toBe(true);
         expect(text.text.length).toBeLessThanOrEqual(block.type === 'header' ? 150 : 2900);
         expect(/[\uD800-\uDBFF]$/.test(text.text)).toBe(false);
       }
-      expect(rendered).toContain('<@U1> *문자 그대로*');
+      expect(rendered).toContain('&lt;@U1&gt; &lt;!channel&gt; &lt;https://example.com|링크&gt; &amp; 원문\n다음 줄');
+      expect(rendered).not.toContain('<@U1>');
       expect(JSON.stringify(reply.blocks)).toContain('sd_proposal_yes');
     }
   });
@@ -418,16 +422,18 @@ describe('single-approval proposals and revision-bound feedback', () => {
     expect(approved.backend.approveProposal).not.toHaveBeenCalled();
   });
   it('withholds Y for blocked or oversized proposals without silently truncating approval content', async () => {
-    for (const state of ['question', 'blocker', 'large', 'evidence'] as const) {
+    for (const state of ['question', 'blocker', 'large', 'evidence', 'escaped'] as const) {
       const fixture = proposalSetup();
       if (state === 'question') fixture.analysis.draft.questions = [{ id: 'Q1', text: '어느 화면인가요?', blocking: true, affectedRequirementIds: ['R1'], sourceRefs: [] }];
       if (state === 'blocker') fixture.plan.blockers = ['대상 파일을 확인해야 합니다.'];
       if (state === 'large') fixture.analysis.draft.requirements[0]!.statement = '가'.repeat(36_000);
       if (state === 'evidence') fixture.analysis.draft.requirements[0]!.sourceRefs[0]!.quote = '가'.repeat(300_000);
+      if (state === 'escaped') fixture.analysis.draft.requirements[0]!.statement = '&'.repeat(30_000);
       const { id, action } = await analyzed(fixture);
       const reply = fixture.service.handleCommand(command(`status ${id}`));
       expect(JSON.stringify(reply.blocks)).not.toContain('sd_proposal_yes'); expect(JSON.stringify(reply.blocks)).toContain('sd_proposal_no');
-      if (state === 'large' || state === 'evidence') expect(reply.text).toContain('Slack 표시 한도');
+      if (state === 'large' || state === 'evidence' || state === 'escaped') expect(reply.text).toContain('Slack 표시 한도');
+      expect(reply.blocks!.length).toBeLessThanOrEqual(50);
       if (state === 'evidence') {
         expect(JSON.stringify(reply.blocks)).not.toContain('sd_proposal_details');
         await expect(fixture.service.handleAction({ ...identity, actionId: 'sd_proposal_details', value: action.nonce })).rejects.toThrow(/Slack 표시 한도/);

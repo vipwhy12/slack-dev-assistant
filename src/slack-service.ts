@@ -63,6 +63,20 @@ const sections = (text: string): Record<string, unknown>[] => {
   }
   return blocks;
 };
+const escapedSlackText = (text: string) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+/** Slack renders LF in mrkdwn. Escape control syntax and disable automatic link/mention parsing. */
+const proposalSections = (text: string): Record<string, unknown>[] => {
+  const blocks: Record<string, unknown>[] = [];
+  let chunk = '';
+  const append = () => { if (chunk) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk, verbatim: true } }); };
+  for (const character of text) {
+    const encoded = escapedSlackText(character);
+    if (chunk.length + encoded.length > 2900) { append(); chunk = ''; }
+    chunk += encoded;
+  }
+  append();
+  return blocks;
+};
 /** Keep short proposal paragraphs separate so Slack does not fold the entire proposal into one section. */
 const proposalBlocks = (text: string): Record<string, unknown>[] => {
   const paragraphs = text.split('\n\n');
@@ -70,10 +84,11 @@ const proposalBlocks = (text: string): Record<string, unknown>[] => {
   const hasHeader = title.length <= 150 && !title.includes('\n') && title.startsWith('[') && title.endsWith(']');
   const header = hasHeader ? [{ type: 'header', text: plain(title) }] : [];
   const body = hasHeader ? paragraphs.slice(1) : paragraphs;
-  const blocks = [...header, ...body.filter(paragraph => paragraph.length > 0).flatMap(sections)];
+  const blocks = [...header, ...body.filter(paragraph => paragraph.length > 0).flatMap(proposalSections)];
   // Reserve space for the details accessory and approval buttons without omitting any content.
-  return blocks.length <= 46 ? blocks : [...header, ...sections(body.join('\n\n'))];
+  return blocks.length <= 46 ? blocks : [...header, ...proposalSections(body.join('\n\n'))];
 };
+const proposalTooLarge = (text: string) => text.length > proposalLimit || proposalBlocks(text).length > 46;
 const proposalEvidence = ({ analysis, plan }: SlackProposal): string => {
   const refs = (values: AnalysisDraft['requirements'][number]['sourceRefs']) => values.map(ref =>
     `원문 ${ref.messageVersionId}: “${ref.quote}”${analysis.evidence?.[ref.messageVersionId] ? `\n${analysis.evidence[ref.messageVersionId]!.permalink}` : ''}`).join('\n') || '(직접 인용 없음)';
@@ -140,7 +155,7 @@ const proposalBlocker = (proposal: SlackProposal, configuredCheckIds?: string[])
   if (!eligibleRequirements(proposal).length) return '승인할 요구사항이 없습니다.';
   if (proposal.plan.blockers.length || proposal.analysis.draft.questions.some(question => question.blocking) ||
     eligibleRequirements(proposal).some(requirement => requirement.blockingQuestionIds.length)) return '차단 질문·사항에 대한 답변이 필요합니다. 아니요 · 수정 요청 버튼이나 feedback 명령으로 알려 주세요.';
-  if (proposalDetails(proposal, configuredCheckIds).length > proposalLimit || proposalEvidence(proposal).length > evidenceLimit) return '제안 또는 상세 근거 전체가 Slack 표시 한도를 넘었습니다. 범위를 줄이거나 로컬 보고서에서 검토하세요.';
+  if (proposalTooLarge(proposalDetails(proposal, configuredCheckIds)) || proposalEvidence(proposal).length > evidenceLimit) return '제안 또는 상세 근거 전체가 Slack 표시 한도를 넘었습니다. 범위를 줄이거나 로컬 보고서에서 검토하세요.';
   return undefined;
 };
 
@@ -439,7 +454,7 @@ export class SlackService {
     if (job.status === 'awaiting_approval' && isProposal(job.result)) {
       const proposal = job.result, checkIds = this.config.development?.commands.map(command => command.id);
       const body = proposalDetails(proposal, checkIds), blocker = proposalBlocker(proposal, checkIds);
-      const tooLarge = body.length > proposalLimit, evidenceTooLarge = proposalEvidence(proposal).length > evidenceLimit;
+      const tooLarge = proposalTooLarge(body), evidenceTooLarge = proposalEvidence(proposal).length > evidenceLimit;
       const text = `${tooLarge ? '제안 전체가 Slack 표시 한도를 넘었습니다. 승인할 수 없습니다. 수정 요청으로 범위를 줄이거나 로컬 보고서를 확인하세요.' : body}${blocker && !tooLarge ? `\n\n승인 대기 사유: ${blocker}` : ''}\n\n작업: ${job.id}`;
       const blocks = proposalBlocks(text);
       if (action?.kind === 'proposal') {
